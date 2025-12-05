@@ -103,6 +103,7 @@ module processor (
     logic [7:0]  color_select;
     logic [3:0]  color_threshold_value;
     logic        gesture_enable;
+    logic        split_centroid_enable;
     // (reference color/tolerance logic removed)
     logic [4:0] current_state_num;  // 5-bit to support states incl. GESTURE
     
@@ -141,7 +142,16 @@ module processor (
     // Bounding box from centroid
     logic [9:0]  centroid_bbox_min_x, centroid_bbox_min_y;
     logic [9:0]  centroid_bbox_max_x, centroid_bbox_max_y;
-
+    // Split centroid outputs
+    logic [9:0]  left_centroid_x, left_centroid_y;
+    logic        left_centroid_valid;
+    logic [9:0]  left_bbox_min_x, left_bbox_min_y;
+    logic [9:0]  left_bbox_max_x, left_bbox_max_y;
+    logic [9:0]  right_centroid_x, right_centroid_y;
+    logic        right_centroid_valid;
+    logic [9:0]  right_bbox_min_x, right_bbox_min_y;
+    logic [9:0]  right_bbox_max_x, right_bbox_max_y;
+    
     // Gesture detection outputs (used for on-screen overlay only)
     logic gesture_fist, gesture_open, gesture_wave;
 
@@ -150,7 +160,8 @@ module processor (
 
     // LEDs: no gesture indicators; keep motor direction on upper LEDs
     assign led[15:12] = motor_direction; // top 4 LEDs show motor direction
-    assign led[11:1]  = 11'b0;           // clear LEDs 11..1
+    assign led[11:2]  = 10'b0;           // clear LEDs 11..2
+    assign led[1]     = 1'b0;            // Debug: LED 1 cleared
     // led[0] is driven by camera cam_done
     
     // ------------------------------------------------------------
@@ -254,12 +265,24 @@ module processor (
     // ------------------------------------------------------------
     // Control Unit - State machine for demo modes
     // ------------------------------------------------------------
-    // btn[0] - Force raw color output (override)
-    // btn[1] - Next demo state
-    // btn[2] - Previous demo state
-    // sw[2:0] - Channel select in CHANNEL_MODE state
-    // sw[3:0] - Threshold value in THRESHOLD/MEDIAN states
-    // sw[15:4] - Reserved for future features
+    // NORMAL MODE (sw[12]=0):
+    //   btn[0] - Force raw color output (override)
+    //   btn[1] - Next demo state
+    //   btn[2] - Previous demo state
+    // 
+    // LEARNING MODE (sw[12]=1):
+    //   btn[2] - Teach current gesture as FIST
+    //   btn[1] - Teach current gesture as OPEN HAND
+    //   btn[0] - Teach current gesture as WAVE
+    // 
+    // sw[2:0]  - Channel select (RGB) in CHANNEL_MODE state
+    // sw[12]   - Learning mode toggle (changes button behavior)
+    // sw[13]   - Compare mode (split screen: left=processed, right=raw)
+    // sw[14]   - Bounding box overlay enable
+    // sw[15]   - Color/grayscale override with btn[0]
+    // 
+    // Potentiometer - Controls threshold values (THRESHOLD, MEDIAN, filter states)
+    //                 and color/skin detection parameters
     
     control_unit ctrl (
         .clk(clk_25m),
@@ -293,6 +316,7 @@ module processor (
         .color_threshold_value(color_threshold_value),
         .temporal_filter_enable(temporal_filter_enable),
         .gesture_enable(gesture_enable),
+        .split_centroid_enable(split_centroid_enable),
         // (reference color/tolerance connections removed)
         .current_state_num(current_state_num)
     );
@@ -388,6 +412,7 @@ module processor (
         .erosion_enable(erosion_enable && !force_grayscale),
         .dilation_enable(dilation_enable && !force_grayscale),
         .centroid_enable(centroid_enable && !force_grayscale),
+        .split_centroid_enable(split_centroid_enable && !force_grayscale),
         .blob_filter_enable(blob_filter_enable && !force_grayscale),
         .gesture_enable(gesture_enable && !force_grayscale),
         .skin_y_min(skin_y_min),
@@ -395,6 +420,8 @@ module processor (
         .color_threshold_enable(color_threshold_enable && !force_grayscale),
         .color_select(color_select),
         .color_threshold_value(color_threshold_value),
+        .learning_mode(sw_sync[12]),        // sw[12]: Enable learning mode
+        .learning_buttons(btn_sync),         // btn[2:0] for teaching gestures
         // (reference color/tolerance connections removed)
         
         // Processed outputs
@@ -412,6 +439,22 @@ module processor (
         .centroid_bbox_min_y(centroid_bbox_min_y),
         .centroid_bbox_max_x(centroid_bbox_max_x),
         .centroid_bbox_max_y(centroid_bbox_max_y),
+        // Split centroid outputs
+        .left_centroid_x(left_centroid_x),
+        .left_centroid_y(left_centroid_y),
+        .left_centroid_valid(left_centroid_valid),
+        .left_bbox_min_x(left_bbox_min_x),
+        .left_bbox_min_y(left_bbox_min_y),
+        .left_bbox_max_x(left_bbox_max_x),
+        .left_bbox_max_y(left_bbox_max_y),
+        .right_centroid_x(right_centroid_x),
+        .right_centroid_y(right_centroid_y),
+        .right_centroid_valid(right_centroid_valid),
+        .right_bbox_min_x(right_bbox_min_x),
+        .right_bbox_min_y(right_bbox_min_y),
+        .right_bbox_max_x(right_bbox_max_x),
+        .right_bbox_max_y(right_bbox_max_y),
+        
         .gesture_fist(gesture_fist),
         .gesture_open(gesture_open),
         .gesture_wave(gesture_wave)
@@ -440,7 +483,7 @@ module processor (
         // In forced grayscale mode: enable processing (grayscale conversion only)
         // In forced color mode: disable processing (use camera data directly)
         // Otherwise: use normal processing pipeline
-        .processing_enable(((grayscale_enable || threshold_enable || median_enable || convolution_enable || skin_threshold_enable || spatial_filter_enable || erosion_enable || dilation_enable || centroid_enable || blob_filter_enable || color_threshold_enable || temporal_filter_enable) && !force_color) || force_grayscale),
+        .processing_enable((((grayscale_enable || threshold_enable || median_enable || convolution_enable || skin_threshold_enable || spatial_filter_enable || erosion_enable || dilation_enable || centroid_enable || blob_filter_enable || color_threshold_enable || temporal_filter_enable || split_centroid_enable) && !force_color) || force_grayscale)),
         // Temporal filter enable
         .temporal_filter_enable(temporal_filter_enable),        
         // Original camera data (for color mode)
@@ -450,7 +493,7 @@ module processor (
         .cam_vsync(vsync_sync),  // Camera vsync for frame counter
         .cam_line_y(cam_line_y),
         .cam_line_ready(cam_line_ready),
-        // Compare mode: sw[13] toggles left processed/right raw split (moved off ch. select)
+        // Compare mode: sw[13] toggles left processed/right raw split
         .compare_mode(sw_sync[13]),
         
         // VGA read interface
@@ -495,9 +538,9 @@ module processor (
         // Control signals
         .channel_mode_enable(channel_mode_enable),
         .channel_select(channel_select),
-        .overlay_enable(centroid_enable || motion_enable),  // Crosshair overlay
-        .bbox_overlay_enable(sw_sync[14] && (centroid_enable || blob_filter_enable)), // Switch 14 toggles bbox in centroid/blob
-        .processing_enable(((grayscale_enable || threshold_enable || median_enable || convolution_enable || skin_threshold_enable || spatial_filter_enable || erosion_enable || dilation_enable || centroid_enable || blob_filter_enable || color_threshold_enable || temporal_filter_enable) && !force_color) || force_grayscale),  // Processing mode: replicate 3-bit grayscale (including forced grayscale)
+        .overlay_enable(centroid_enable || motion_enable || split_centroid_enable),  // Crosshair overlay
+        .bbox_overlay_enable(sw_sync[14] && (centroid_enable || blob_filter_enable || split_centroid_enable)), // Switch 14 toggles bbox
+        .processing_enable((((grayscale_enable || threshold_enable || median_enable || convolution_enable || skin_threshold_enable || spatial_filter_enable || erosion_enable || dilation_enable || centroid_enable || blob_filter_enable || color_threshold_enable || temporal_filter_enable || split_centroid_enable) && !force_color) || force_grayscale)),  // Processing mode: replicate 3-bit grayscale (including forced grayscale)
         .temporal_filter_enable(temporal_filter_enable),  // Enable temporal filtering
         .frame_chunk_counter(frame_chunk_counter),  // Frame chunk counter for temporal filter
         .force_color(force_color),  // Force color override
@@ -505,6 +548,7 @@ module processor (
         .current_state(current_state_num), // Current state for text display
         // Gesture overlay enable comes from control unit's gesture state
         .gesture_enable(gesture_enable),   // Enable gesture text overlay
+        .split_centroid_enable(split_centroid_enable),
         
         // VGA timing
         .draw_x(draw_x),
@@ -519,10 +563,29 @@ module processor (
         .centroid_bbox_min_y(centroid_bbox_min_y),
         .centroid_bbox_max_x(centroid_bbox_max_x),
         .centroid_bbox_max_y(centroid_bbox_max_y),
+        // Dual centroids for split mode
+        .left_centroid_x(left_centroid_x),
+        .left_centroid_y(left_centroid_y),
+        .left_centroid_valid(left_centroid_valid),
+        .left_bbox_min_x(left_bbox_min_x),
+        .left_bbox_min_y(left_bbox_min_y),
+        .left_bbox_max_x(left_bbox_max_x),
+        .left_bbox_max_y(left_bbox_max_y),
+        .right_centroid_x(right_centroid_x),
+        .right_centroid_y(right_centroid_y),
+        .right_centroid_valid(right_centroid_valid),
+        .right_bbox_min_x(right_bbox_min_x),
+        .right_bbox_min_y(right_bbox_min_y),
+        .right_bbox_max_x(right_bbox_max_x),
+        .right_bbox_max_y(right_bbox_max_y),
+        
         .gesture_fist(gesture_fist),
         .gesture_open(gesture_open),
         // Use only detected wave gesture (no switch override)
         .gesture_wave(gesture_wave),
+        
+        // Button inputs for pong
+        .btn_sync(btn_sync),
         
         // Input pixels from frame buffer
         .pixel_red_in(vga_red_raw),

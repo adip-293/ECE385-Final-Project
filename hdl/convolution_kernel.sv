@@ -42,8 +42,8 @@ module convolution_kernel (
     logic [3:0] edge_magnitude;
     
     // Gaussian blur calculation
-    logic [9:0] gaussian_sum;  // Increased bit width for stronger weights
-    logic [9:0] rounded32;     // Rounded divide-by-32 approximation
+    logic [10:0] gaussian_sum;  // Increased bit width for stronger weights
+    logic [10:0] gaussian_div;  // Proper division result
     logic [3:0] blurred_pixel;
     
     // Sharpen calculation
@@ -58,23 +58,21 @@ module convolution_kernel (
         if (enable) begin
             case (kernel_select)
                 2'b00: begin
-                    // GAUSSIAN BLUR - stronger weighted average
-                    // Kernel weights: [1 4 1; 4 16 4; 1 4 1] / 36
-                    gaussian_sum = p00 + (p01 << 2) + p02 +
-                                  (p10 << 2) + (p11 << 4) + (p12 << 2) +
-                                   p20 + (p21 << 2) + p22;
+                    // GAUSSIAN BLUR - stronger weighted average for more visible blurring
+                    // Enhanced kernel weights: [2 8 2; 8 32 8; 2 8 2] / 64
+                    // This creates a more pronounced blur effect than standard Gaussian
+                    gaussian_sum = (p00 << 1) + (p01 << 3) + (p02 << 1) +
+                                  (p10 << 3) + (p11 << 5) + (p12 << 3) +
+                                  (p20 << 1) + (p21 << 3) + (p22 << 1);
                     
-                    // Rounded divide-by-32 approximation to 36: add 16 before shifting
-                    // This reduces truncation blackening of low-intensity pixels
-                    rounded32 = (gaussian_sum + 10'd16) >> 5;
+                    // Divide by 64 (shift right by 6) with rounding
+                    gaussian_div = (gaussian_sum + 11'd32) >> 6;
 
-                    // Ensure a nonzero output when the sum is nonzero (min brightness clamp)
-                    if ((gaussian_sum != 10'd0) && (rounded32 == 10'd0)) begin
-                        blurred_pixel = 4'd1;
-                    end else if (rounded32 > 10'd15) begin
+                    // Clamp to 4-bit range
+                    if (gaussian_div > 11'd15) begin
                         blurred_pixel = 4'd15;
                     end else begin
-                        blurred_pixel = rounded32[3:0];
+                        blurred_pixel = gaussian_div[3:0];
                     end
                     pixel_out = blurred_pixel;
                 end

@@ -44,11 +44,14 @@ module preprocessor (
     input  logic        centroid_enable,
     input  logic        blob_filter_enable,
     input  logic        gesture_enable,
+    input  logic        split_centroid_enable,
     input  logic [3:0]  skin_y_min,
     input  logic [3:0]  skin_y_max,
     input  logic        color_threshold_enable,
     input  logic [7:0]  color_select,
     input  logic [3:0]  color_threshold_value,
+    input  logic        learning_mode,      // sw[13]: Enable learning mode
+    input  logic [2:0]  learning_buttons,   // btn[2:0] for teaching in learning mode
     
     // Processed outputs
     output logic [2:0]  processed_pixel,
@@ -65,6 +68,22 @@ module preprocessor (
     output logic [9:0]  centroid_bbox_min_y,
     output logic [9:0]  centroid_bbox_max_x,
     output logic [9:0]  centroid_bbox_max_y,
+
+    // Split centroid outputs (left/right halves)
+    output logic [9:0]  left_centroid_x,
+    output logic [9:0]  left_centroid_y,
+    output logic        left_centroid_valid,
+    output logic [9:0]  left_bbox_min_x,
+    output logic [9:0]  left_bbox_min_y,
+    output logic [9:0]  left_bbox_max_x,
+    output logic [9:0]  left_bbox_max_y,
+    output logic [9:0]  right_centroid_x,
+    output logic [9:0]  right_centroid_y,
+    output logic        right_centroid_valid,
+    output logic [9:0]  right_bbox_min_x,
+    output logic [9:0]  right_bbox_min_y,
+    output logic [9:0]  right_bbox_max_x,
+    output logic [9:0]  right_bbox_max_y,
     
     // Gesture outputs
     output logic        gesture_fist,
@@ -315,6 +334,21 @@ module preprocessor (
             centroid_x_coord = color_mask_out_x;
             centroid_y_coord = color_mask_out_y;
             centroid_pixel_valid = cam_pix_write && color_mask_neighborhood_valid && !is_border_color_mask;
+        end else if (dilation_enable) begin
+            // Use dilation buffer coordinates
+            centroid_x_coord = dilation_out_x;
+            centroid_y_coord = dilation_out_y;
+            centroid_pixel_valid = cam_pix_write && dilation_neighborhood_valid && !is_border_dilation;
+        end else if (erosion_enable) begin
+            // Use erosion buffer coordinates
+            centroid_x_coord = erosion_out_x;
+            centroid_y_coord = erosion_out_y;
+            centroid_pixel_valid = cam_pix_write && erosion_neighborhood_valid && !is_border_erosion;
+        end else if (spatial_filter_enable) begin
+            // Use spatial filter buffer coordinates
+            centroid_x_coord = mask_out_x;
+            centroid_y_coord = mask_out_y;
+            centroid_pixel_valid = cam_pix_write && mask_neighborhood_valid && !is_border_mask;
         end else begin
             // Use camera coordinates for direct color mask or skin mask
             // EXCLUDE BORDER PIXELS to prevent edge artifacts from affecting centroid
@@ -353,6 +387,40 @@ module preprocessor (
         .bbox_max_y(centroid_bbox_max_y)
     );
 
+    // Split centroid detector for multiplayer (left/right halves)
+    split_centroid_detector #(
+        .FRAME_WIDTH(640),
+        .FRAME_HEIGHT(480),
+        .MIN_BLOB_SIZE(300)
+    ) split_centroid_det (
+        .clk(clk),
+        .rst_n(rst_n),
+        .enable(split_centroid_enable),
+        .mask_pixel(centroid_mask_source),
+        .pixel_x(centroid_x_coord),
+        .pixel_y(centroid_y_coord),
+        .pixel_valid(centroid_pixel_valid),
+        .frame_start(frame_start),
+        // left
+        .left_centroid_x(left_centroid_x),
+        .left_centroid_y(left_centroid_y),
+        .left_centroid_valid(left_centroid_valid),
+        .left_blob_area(),
+        .left_bbox_min_x(left_bbox_min_x),
+        .left_bbox_min_y(left_bbox_min_y),
+        .left_bbox_max_x(left_bbox_max_x),
+        .left_bbox_max_y(left_bbox_max_y),
+        // right
+        .right_centroid_x(right_centroid_x),
+        .right_centroid_y(right_centroid_y),
+        .right_centroid_valid(right_centroid_valid),
+        .right_blob_area(),
+        .right_bbox_min_x(right_bbox_min_x),
+        .right_bbox_min_y(right_bbox_min_y),
+        .right_bbox_max_x(right_bbox_max_x),
+        .right_bbox_max_y(right_bbox_max_y)
+    );
+    
     // Keep the last valid bounding box for blob filtering
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -649,10 +717,12 @@ module preprocessor (
     end
 
     //=============================================================================
-    // GESTURE DETECTION
+    // GESTURE DETECTION (Perceptron-based Learning)
     //=============================================================================
-    // Analyzes blob characteristics to detect gestures
-    gesture_detector gesture_det (
+    // Adaptive perceptron classifier that learns from user feedback
+    // sw[13]=1: Learning mode - buttons teach gestures
+    // btn[2]: fist, btn[1]: open, btn[0]: wave
+    gesture_perceptron gesture_percep (
         .clk(clk),
         .rst_n(rst_n),
         .enable(gesture_enable),
@@ -665,9 +735,14 @@ module preprocessor (
         .bbox_max_x(centroid_bbox_max_x),
         .bbox_max_y(centroid_bbox_max_y),
         .blob_area(blob_area),
+        .learning_mode(learning_mode),
+        .learning_buttons(learning_buttons),
         .fist(gesture_fist),
         .open_hand(gesture_open),
-        .wave(gesture_wave)
+        .wave(gesture_wave),
+        .debug_activation_fist(),   // Optional: wire to LEDs for debugging
+        .debug_activation_open(),
+        .debug_activation_wave()
     );
 
 endmodule
