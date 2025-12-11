@@ -44,13 +44,21 @@ module motor_driver(
 
     localparam integer PWM_CYCLE = 500_000;
 
-    localparam integer PWM_TILT_MIN = 19_300; //0967
-    localparam integer PWM_TILT_CENTER = 28_000;
-    localparam integer PWM_TILT_MAX = 36_700; //11EB
+    // localparam integer PWM_TILT_MIN = 19_300; //0967
+    // localparam integer PWM_TILT_CENTER = 28_000;
+    // localparam integer PWM_TILT_MAX = 36_700; //11EB
 
-    localparam integer PWM_PAN_MIN =11_300; //05E8
-    localparam integer PWM_PAN_CENTER = 36_650;
-    localparam integer PWM_PAN_MAX = 62_000; //1E39
+    // localparam integer PWM_PAN_MIN =11_300; //05E8
+    // localparam integer PWM_PAN_CENTER = 36_650;
+    // localparam integer PWM_PAN_MAX = 62_000; //1E39
+
+    localparam integer PWM_TILT_MIN = 9_000;
+    localparam integer PWM_TILT_CENTER = 15_000;
+    localparam integer PWM_TILT_MAX = 22_500;
+
+    localparam integer PWM_PAN_MIN = 16_000;
+    localparam integer PWM_PAN_CENTER = 40_500;
+    localparam integer PWM_PAN_MAX = 65_000;
 
 
     logic [18:0] counter;

@@ -16,8 +16,11 @@
  *     SHARPEN, EMBOSS, SKIN, SPATIAL, ERODE, DILATE, CENTROID, BLOB, SKIN_MOTION,
  *     COLOR_THRESH, COLOR_TRACK, GESTURE (20 states total)
  *   - btn[0]: toggle override (force color/grayscale based on sw[15])
- *   - btn[1]: next state, btn[2]: previous state
- *   - sw[3:0]: threshold value, pot_in[15:8]: color/skin params
+ *   - btn[1]: next state, btn[2]: previous state (disabled in learning mode)
+ *   - sw[2:0]: channel select (RGB) in CHANNEL_MODE state
+ *   - sw[12]: learning mode toggle (changes button behavior for gesture training)
+ *   - sw[13]: compare mode (split screen processed/raw)
+ *   - Potentiometer: controls threshold values and color/skin parameters
  */
 
 module control_unit (
@@ -51,40 +54,49 @@ module control_unit (
     output logic [3:0]  skin_y_min,            // Skin threshold Y min (tunable)
     output logic [3:0]  skin_y_max,            // Skin threshold Y max (tunable)
     output logic        color_threshold_enable, // Enable color thresholding
-    output logic [7:0]  color_select,           // Color selection from potentiometer
-    output logic [3:0]  color_threshold_value,  // Hamming distance threshold
+    output logic [11:0] ref_color,              // Reference color {R[3:0], G[3:0], B[3:0]} from potentiometer
+    output logic [5:0]  color_threshold_value,  // Manhattan distance threshold (0-45)
     output logic        temporal_filter_enable, // Enable temporal filtering (moving average across frames)
     output logic        gesture_enable,         // Enable gesture detection overlay
+    output logic        augment_enable,         // Enable augment mode (square overlay)
+    output logic        split_centroid_enable,  // Enable split (dual) centroid detection
+    output logic        dither_enable,          // Enable dithered color compression
     // (reference color/tolerance outputs removed)
-    output logic [4:0]  current_state_num    // Current state number for display (5-bit for 17 states)
+    output logic [4:0]  current_state_num,   // Current state number for display (5-bit for 22 states)
+    // Transition trigger for ripple effect (override toggles only)
+    output logic        transition_trigger      // Pulse on override toggle change
 );
 
     // ------------------------------------------------------------
     // Demo State Enumeration
     // ------------------------------------------------------------
     // Re-ordered / corrected enumeration to provide unique codes and align
-    // with updated text overlay indices (DILATE added, GESTURE last)
+    // with updated text overlay indices (DILATE added, GESTURE, PONG)
     typedef enum logic [4:0] {
         RAW          = 5'd0,   // Raw color output
-        CHANNEL_MODE = 5'd1,   // Individual channel display (controlled by sw[2:0])
-        GRAYSCALE    = 5'd2,   // Grayscale converted output
-        THRESHOLD    = 5'd3,   // Binary threshold on grayscale
-        TEMPORAL     = 5'd4,   // Temporal filter: moving average across frames to reduce noise
-        MEDIAN       = 5'd5,   // Median filter then threshold
-        GAUSSIAN     = 5'd6,   // Gaussian blur (convolution, sw[15] for threshold)
-        SOBEL        = 5'd7,   // Sobel edge detection with threshold
-        SHARPEN      = 5'd8,   // Sharpen filter (sw[15] for threshold)
-        EMBOSS       = 5'd9,   // Emboss 3D relief effect (sw[15] for threshold)
-        SKIN         = 5'd10,  // Skin thresholding (binary mask)
-        SPATIAL      = 5'd11,  // 3x3 spatial noise filter on skin mask
-        ERODE        = 5'd12,  // Erosion: remove small white specs
-        DILATE       = 5'd13,  // Dilation (opening visualization after erosion)
-        CENTROID     = 5'd14,  // Centroid detection (after opening)
-        BLOB         = 5'd15,  // Blob filtering around centroid
-        SKIN_MOTION  = 5'd16,  // Skin motion tracking (motors enabled)
-        COLOR_THRESH = 5'd17,  // Color thresholding (Hamming distance)
-        COLOR_TRACK  = 5'd18,  // Color tracking + centroid + motion
-        GESTURE      = 5'd19   // Gesture detection based on blob/centroid pipeline
+        DITHER       = 5'd1,   // Dithered color compression (RGB444 -> RGB333 with dithering)
+        CHANNEL_MODE = 5'd2,   // Individual channel display (controlled by sw[2:0])
+        GRAYSCALE    = 5'd3,   // Grayscale converted output
+        THRESHOLD    = 5'd4,   // Binary threshold on grayscale
+        TEMPORAL     = 5'd5,   // Temporal filter: moving average across frames to reduce noise
+        MEDIAN       = 5'd6,   // Median filter then threshold
+        GAUSSIAN     = 5'd7,   // Gaussian blur (convolution, sw[15] for threshold)
+        SOBEL        = 5'd8,   // Sobel edge detection with threshold
+        SHARPEN      = 5'd9,   // Sharpen filter (sw[15] for threshold)
+        EMBOSS       = 5'd10,  // Emboss 3D relief effect (sw[15] for threshold)
+        SKIN         = 5'd11,  // Skin thresholding (binary mask)
+        SPATIAL      = 5'd12,  // 3x3 spatial noise filter on skin mask
+        ERODE        = 5'd13,  // Erosion: remove small white specs
+        DILATE       = 5'd14,  // Dilation (opening visualization after erosion)
+        CENTROID     = 5'd15,  // Centroid detection (after opening)
+        BLOB         = 5'd16,  // Blob filtering around centroid
+        SKIN_MOTION  = 5'd17,  // Skin motion tracking (motors enabled)
+        COLOR_THRESH = 5'd18,  // Color thresholding (Hamming distance)
+        COLOR_TRACK  = 5'd19,  // Color tracking + centroid + motion
+        GESTURE      = 5'd20,  // Gesture detection based on blob/centroid pipeline
+        AUGMENT      = 5'd23,  // Augment mode: square overlay with gesture-controlled dragging
+        DUAL_CENT    = 5'd21,  // Dual centroid (left/right halves)
+        PONG         = 5'd22   // Pong game mode
     } demo_state_t;
     
     demo_state_t current_state, next_state;
@@ -106,21 +118,30 @@ module control_unit (
             override_toggle <= 1'b0;
         end else begin
             btn_prev  <= btn_sync;
-            // Toggle override state on button press
-            if (btn_override_pressed) begin
+            // Toggle override state on button press (only if not in PONG state)
+            if (btn_override_pressed && (current_state != PONG)) begin
                 override_toggle <= ~override_toggle;
             end
             // Clear override when changing states so new state's visuals are visible
             if (btn_next_pressed || btn_prev_pressed) begin
                 override_toggle <= 1'b0;
             end
+            // Clear override when entering PONG state (btn[0] is used for rematch in PONG)
+            if (current_state == PONG) begin
+                override_toggle <= 1'b0;
+            end
         end
     end
     
     // Edge detection - trigger on rising edge
-    assign btn_override_pressed = btn_sync[0] & ~btn_prev[0];  // btn[0]
-    assign btn_next_pressed     = btn_sync[1] & ~btn_prev[1];  // btn[1]
-    assign btn_prev_pressed     = btn_sync[2] & ~btn_prev[2];  // btn[2]
+    // In learning mode (sw[12]=1), buttons are used for gesture teaching instead
+    logic learning_mode;
+    assign learning_mode = sw_sync[12];
+    
+    // btn[0] override disabled in learning mode and PONG state (used for rematch in PONG)
+    assign btn_override_pressed = btn_sync[0] & ~btn_prev[0] & ~learning_mode & (current_state != PONG);
+    assign btn_next_pressed     = btn_sync[1] & ~btn_prev[1] & ~learning_mode;  // btn[1] - disabled in learning mode
+    assign btn_prev_pressed     = btn_sync[2] & ~btn_prev[2] & ~learning_mode;  // btn[2] - disabled in learning mode
    
     // ------------------------------------------------------------
     // FSM: Next State Logic
@@ -132,7 +153,8 @@ module control_unit (
         if (btn_next_pressed) begin
             // Cycle to next state
             case (current_state)
-                RAW:          next_state = CHANNEL_MODE;
+                RAW:          next_state = DITHER;
+                DITHER:       next_state = CHANNEL_MODE;
                 CHANNEL_MODE: next_state = GRAYSCALE;
                 GRAYSCALE:    next_state = THRESHOLD;
                 THRESHOLD:    next_state = TEMPORAL;
@@ -151,14 +173,18 @@ module control_unit (
                 SKIN_MOTION:  next_state = COLOR_THRESH;
                 COLOR_THRESH: next_state = COLOR_TRACK;
                 COLOR_TRACK:  next_state = GESTURE;
-                GESTURE:      next_state = RAW;      // Wrap around
+                GESTURE:      next_state = AUGMENT;
+                AUGMENT:      next_state = DUAL_CENT;
+                DUAL_CENT:    next_state = PONG;
+                PONG:         next_state = RAW;      // Wrap around
                 default:      next_state = RAW;
             endcase
         end else if (btn_prev_pressed) begin
             // Cycle to previous state
             case (current_state)
-                RAW:          next_state = GESTURE;     // Wrap around
-                CHANNEL_MODE: next_state = RAW;
+                RAW:          next_state = PONG;        // Wrap around to Pong
+                DITHER:       next_state = RAW;
+                CHANNEL_MODE: next_state = DITHER;
                 GRAYSCALE:    next_state = CHANNEL_MODE;
                 THRESHOLD:    next_state = GRAYSCALE;
                 TEMPORAL:     next_state = THRESHOLD;
@@ -177,6 +203,9 @@ module control_unit (
                 COLOR_THRESH: next_state = SKIN_MOTION;
                 COLOR_TRACK:  next_state = COLOR_THRESH;
                 GESTURE:      next_state = COLOR_TRACK;
+                AUGMENT:      next_state = GESTURE;
+                DUAL_CENT:    next_state = AUGMENT;
+                PONG:         next_state = DUAL_CENT;
                 default:      next_state = RAW;
             endcase
         end
@@ -192,6 +221,24 @@ module control_unit (
             current_state <= next_state;
         end
     end
+    
+    // ------------------------------------------------------------
+    // Transition Trigger - Override Toggles Only
+    // ------------------------------------------------------------
+    // Only trigger transitions on override toggle changes (not state changes)
+    logic prev_override_toggle;
+    
+    // Track previous override state for edge detection
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            prev_override_toggle <= 1'b0;
+        end else begin
+            prev_override_toggle <= override_toggle;
+        end
+    end
+    
+    // Detect override toggle changes only
+    assign transition_trigger = override_toggle != prev_override_toggle;
     
     // ------------------------------------------------------------
     // FSM: Output Logic
@@ -219,14 +266,18 @@ module control_unit (
         skin_y_min          = 4'd2;   // Default: allow darker skin
         skin_y_max          = 4'd14;  // Default: allow lighter skin
         color_threshold_enable = 1'b0;
-        color_select        = 8'h00;
-        color_threshold_value = 4'h0;
+        ref_color              = 12'h000;
+        color_threshold_value  = 6'd0;
         temporal_filter_enable = 1'b0;
         gesture_enable      = 1'b0;
+        augment_enable      = 1'b0;
+        split_centroid_enable = 1'b0;
+        dither_enable      = 1'b0;
+        blob_filter_enable  = 1'b0;
         // Reference color/tolerance logic removed
         
-        // Check for override toggle state
-        if (override_toggle) begin
+        // Check for override toggle state (disabled in PONG state - btn[0] is for rematch)
+        if (override_toggle && (current_state != PONG)) begin
             // Override enabled: force DISPLAY output based on sw[15]
             // sw[15] = 1: display raw color
             // sw[15] = 0: display plain grayscale
@@ -255,6 +306,23 @@ module control_unit (
                     spatial_filter_enable = 1'b0;
                     erosion_enable      = 1'b0;
                     dilation_enable     = 1'b0;
+                    dither_enable      = 1'b0;
+                end
+                
+                DITHER: begin
+                    grayscale_enable    = 1'b0;
+                    channel_mode_enable = 1'b0;
+                    channel_select      = 3'b111;
+                    threshold_enable    = 1'b0;
+                    threshold_value     = 4'h0;
+                    median_enable       = 1'b0;
+                    convolution_enable  = 1'b0;
+                    kernel_select       = 2'b00;
+                    skin_threshold_enable = 1'b0;
+                    spatial_filter_enable = 1'b0;
+                    erosion_enable      = 1'b0;
+                    dilation_enable     = 1'b0;
+                    dither_enable      = 1'b1;
                 end
                 
                 CHANNEL_MODE: begin
@@ -270,6 +338,7 @@ module control_unit (
                     spatial_filter_enable = 1'b0;
                     erosion_enable      = 1'b0;
                     dilation_enable     = 1'b0;
+                    dither_enable      = 1'b0;
                 end
                 
                 GRAYSCALE: begin
@@ -462,6 +531,7 @@ module control_unit (
                     erosion_enable        = 1'b1;
                     dilation_enable       = 1'b1;
                     centroid_enable       = 1'b0;
+                    split_centroid_enable = 1'b0;
                     blob_filter_enable    = 1'b0;
                     motion_enable         = 1'b0;
                     skin_y_min            = pot_in[15:12];
@@ -482,6 +552,47 @@ module control_unit (
                     erosion_enable        = 1'b1;
                     dilation_enable       = 1'b1;
                     centroid_enable       = 1'b1;
+                    split_centroid_enable = 1'b0;
+                    motion_enable         = 1'b0;
+                    skin_y_min            = pot_in[15:12];
+                    skin_y_max            = pot_in[11:8];
+                end
+                
+                DUAL_CENT: begin
+                    grayscale_enable      = 1'b0;
+                    channel_mode_enable   = 1'b0;
+                    channel_select        = 3'b111;
+                    threshold_enable      = 1'b0;
+                    threshold_value       = 4'h0;
+                    median_enable         = 1'b0;
+                    convolution_enable    = 1'b0;
+                    kernel_select         = 2'b00;
+                    skin_threshold_enable = 1'b1;
+                    spatial_filter_enable = 1'b1;
+                    erosion_enable        = 1'b1;
+                    dilation_enable       = 1'b1;
+                    centroid_enable       = 1'b0; // use split pipeline instead
+                    split_centroid_enable = 1'b1;
+                    motion_enable         = 1'b0;
+                    skin_y_min            = pot_in[15:12];
+                    skin_y_max            = pot_in[11:8];
+                end
+                
+                PONG: begin
+                    grayscale_enable      = 1'b0;
+                    channel_mode_enable   = 1'b0;
+                    channel_select        = 3'b111;
+                    threshold_enable      = 1'b0;
+                    threshold_value       = 4'h0;
+                    median_enable         = 1'b0;
+                    convolution_enable    = 1'b0;
+                    kernel_select         = 2'b00;
+                    skin_threshold_enable = 1'b1;
+                    spatial_filter_enable = 1'b1;
+                    erosion_enable        = 1'b1;
+                    dilation_enable       = 1'b1;
+                    centroid_enable       = 1'b0; // use split pipeline instead
+                    split_centroid_enable = 1'b1;
                     motion_enable         = 1'b0;
                     skin_y_min            = pot_in[15:12];
                     skin_y_max            = pot_in[11:8];
@@ -501,6 +612,7 @@ module control_unit (
                     erosion_enable        = 1'b1;
                     dilation_enable       = 1'b1;
                     centroid_enable       = 1'b1;
+                    split_centroid_enable = 1'b0;
                     blob_filter_enable    = 1'b1;
                     motion_enable         = 1'b0;
                     skin_y_min            = pot_in[15:12];
@@ -526,8 +638,8 @@ module control_unit (
                     skin_y_min            = pot_in[15:12];
                     skin_y_max            = pot_in[11:8];
                     color_threshold_enable = 1'b0;
-                    color_select         = 8'h00;
-                    color_threshold_value = 4'h0;
+                    ref_color              = 12'h000;
+                    color_threshold_value  = 6'd0;
                 end
                 
                 COLOR_THRESH: begin
@@ -548,8 +660,11 @@ module control_unit (
                     skin_y_min            = 4'd2;
                     skin_y_max            = 4'd14;
                     color_threshold_enable = 1'b1;
-                    color_select          = pot_in[15:8];
-                    color_threshold_value = sw_sync[3:0];
+                    // Interleaved bits for balanced tuning: Red={15,12,9,6}, Green={14,11,8,5}, Blue={13,10,7,4}
+                    ref_color              = {{pot_in[15], pot_in[12], pot_in[9], pot_in[6]}, 
+                                               {pot_in[14], pot_in[11], pot_in[8], pot_in[5]}, 
+                                               {pot_in[13], pot_in[10], pot_in[7], pot_in[4]}};
+                    color_threshold_value  = sw_sync[5:0];  // 6-bit Manhattan distance threshold from switches (0-45 recommended)
                 end
                 
                 COLOR_TRACK: begin
@@ -570,8 +685,11 @@ module control_unit (
                     skin_y_min            = 4'd2;
                     skin_y_max            = 4'd14;
                     color_threshold_enable = 1'b1;
-                    color_select          = pot_in[15:8];
-                    color_threshold_value = sw_sync[3:0];
+                    // Interleaved bits for balanced tuning: Red={15,12,9,6}, Green={14,11,8,5}, Blue={13,10,7,4}
+                    ref_color              = {{pot_in[15], pot_in[12], pot_in[9], pot_in[6]}, 
+                                               {pot_in[14], pot_in[11], pot_in[8], pot_in[5]}, 
+                                               {pot_in[13], pot_in[10], pot_in[7], pot_in[4]}};
+                    color_threshold_value  = sw_sync[5:0];  // 6-bit Manhattan distance threshold from switches (0-45 recommended)
                 end
                 
                 GESTURE: begin
@@ -595,6 +713,48 @@ module control_unit (
                     skin_y_max            = pot_in[11:8];
                 end
                 
+                AUGMENT: begin
+                    grayscale_enable      = 1'b0;
+                    channel_mode_enable   = 1'b0;
+                    channel_select        = 3'b111;
+                    threshold_enable      = 1'b0;
+                    threshold_value       = 4'h0;
+                    median_enable         = 1'b0;
+                    convolution_enable    = 1'b0;
+                    kernel_select         = 2'b00;
+                    skin_threshold_enable = 1'b1;
+                    spatial_filter_enable = 1'b1;
+                    erosion_enable        = 1'b1;
+                    dilation_enable       = 1'b1;
+                    centroid_enable       = 1'b1;
+                    blob_filter_enable    = 1'b1;
+                    motion_enable         = 1'b0;
+                    gesture_enable        = 1'b1;
+                    augment_enable        = 1'b1;
+                    skin_y_min            = pot_in[15:12];
+                    skin_y_max            = pot_in[11:8];
+                end
+                
+                DUAL_CENT: begin
+                    grayscale_enable      = 1'b0;
+                    channel_mode_enable   = 1'b0;
+                    channel_select        = 3'b111;
+                    threshold_enable      = 1'b0;
+                    threshold_value       = 4'h0;
+                    median_enable         = 1'b0;
+                    convolution_enable    = 1'b0;
+                    kernel_select         = 2'b00;
+                    skin_threshold_enable = 1'b1;
+                    spatial_filter_enable = 1'b1;
+                    erosion_enable        = 1'b1;
+                    dilation_enable       = 1'b1;
+                    centroid_enable       = 1'b0;  // use split pipeline instead
+                    split_centroid_enable = 1'b1;
+                    motion_enable         = 1'b0;
+                    skin_y_min            = pot_in[15:12];
+                    skin_y_max            = pot_in[11:8];
+                end
+                
                 default: begin
                     grayscale_enable      = 1'b0;
                     channel_mode_enable   = 1'b0;
@@ -613,8 +773,8 @@ module control_unit (
                     skin_y_min          = 4'd2;
                     skin_y_max          = 4'd14;
                     color_threshold_enable = 1'b0;
-                    color_select         = 8'h00;
-                    color_threshold_value = 4'h0;
+                    ref_color              = 12'h000;
+                    color_threshold_value  = 6'd0;
                 end
             endcase
         end else begin
@@ -634,6 +794,24 @@ module control_unit (
                     spatial_filter_enable = 1'b0;
                     erosion_enable      = 1'b0;
                     dilation_enable     = 1'b0;
+                    dither_enable      = 1'b0;
+                end
+                
+                DITHER: begin
+                    grayscale_enable    = 1'b0;
+                    force_color         = 1'b0;
+                    channel_mode_enable = 1'b0;
+                    channel_select      = 3'b111;  // RGB all enabled
+                    threshold_enable    = 1'b0;
+                    threshold_value     = 4'h0;
+                    median_enable       = 1'b0;
+                    convolution_enable  = 1'b0;
+                    kernel_select       = 2'b00;
+                    skin_threshold_enable = 1'b0;
+                    spatial_filter_enable = 1'b0;
+                    erosion_enable      = 1'b0;
+                    dilation_enable     = 1'b0;
+                    dither_enable      = 1'b1;
                 end
                 
                 CHANNEL_MODE: begin
@@ -872,7 +1050,7 @@ module control_unit (
                     skin_threshold_enable = 1'b1;
                     spatial_filter_enable = 1'b1;
                     erosion_enable        = 1'b1;  // keep prior erosion
-                    dilation_enable       = 1'b1;  // add dilation
+                    dilation_enable       = 1'b1;  // Enable dilation operation
                     centroid_enable       = 1'b0;  // visualization only
                     blob_filter_enable    = 1'b0;
                     motion_enable         = 1'b0;
@@ -946,14 +1124,17 @@ module control_unit (
                     skin_y_min            = pot_in[15:12];
                     skin_y_max            = pot_in[11:8];
                     color_threshold_enable = 1'b0;
-                    color_select         = 8'h00;
-                    color_threshold_value = 4'h0;
+                    ref_color              = 12'h000;
+                    color_threshold_value  = 6'd0;
                 end
                 
                 COLOR_THRESH: begin
-                    // Color thresholding: Hamming distance based color matching
-                    // pot_in[15:8] = color_select (8-bit color selection)
-                    // sw_sync[3:0] = threshold value (Hamming distance threshold) - use switches for better resolution
+                    // Color thresholding: Manhattan distance based color matching
+                    // Reference color uses interleaved potentiometer bits for balanced tuning:
+                    //   Red:   {pot_in[15], pot_in[12], pot_in[9], pot_in[6]}
+                    //   Green: {pot_in[14], pot_in[11], pot_in[8], pot_in[5]}
+                    //   Blue:  {pot_in[13], pot_in[10], pot_in[7], pot_in[4]}
+                    // sw_sync[5:0] = threshold value (Manhattan distance threshold, 0-45 recommended)
                     grayscale_enable      = 1'b0;
                     force_color           = 1'b0;
                     channel_mode_enable   = 1'b0;
@@ -968,18 +1149,25 @@ module control_unit (
                     erosion_enable        = 1'b0;
                     dilation_enable       = 1'b0;
                     centroid_enable       = 1'b1;  // Enable centroid overlay
+                    split_centroid_enable = 1'b0;
                     motion_enable         = 1'b0;
                     skin_y_min            = 4'd2;
                     skin_y_max            = 4'd14;
                     color_threshold_enable = 1'b1;
-                    color_select          = pot_in[15:8];  // 8-bit color selection from potentiometer
-                    color_threshold_value = sw_sync[3:0];  // 4-bit Hamming distance threshold from switches
+                    // Interleaved bits for balanced tuning: Red={15,12,9,6}, Green={14,11,8,5}, Blue={13,10,7,4}
+                    ref_color              = {{pot_in[15], pot_in[12], pot_in[9], pot_in[6]}, 
+                                               {pot_in[14], pot_in[11], pot_in[8], pot_in[5]}, 
+                                               {pot_in[13], pot_in[10], pot_in[7], pot_in[4]}};
+                    color_threshold_value  = sw_sync[5:0];  // 6-bit Manhattan distance threshold from switches (0-45 recommended)
                 end
                 
                 COLOR_TRACK: begin
                     // Color tracking: color threshold + centroid + motion tracking
-                    // pot_in[15:8] = color_select (8-bit color selection)
-                    // sw_sync[3:0] = threshold value (Hamming distance threshold) - use switches for better resolution
+                    // Reference color uses interleaved potentiometer bits for balanced tuning:
+                    //   Red:   {pot_in[15], pot_in[12], pot_in[9], pot_in[6]}
+                    //   Green: {pot_in[14], pot_in[11], pot_in[8], pot_in[5]}
+                    //   Blue:  {pot_in[13], pot_in[10], pot_in[7], pot_in[4]}
+                    // sw_sync[5:0] = threshold value (Manhattan distance threshold, 0-45 recommended)
                     grayscale_enable      = 1'b0;
                     force_color           = 1'b0;
                     channel_mode_enable   = 1'b0;
@@ -994,12 +1182,16 @@ module control_unit (
                     erosion_enable        = 1'b0;
                     dilation_enable       = 1'b0;
                     centroid_enable       = 1'b1;  // Enable centroid detection
+                    split_centroid_enable = 1'b0;
                     motion_enable         = 1'b1;  // Enable motor tracking!
                     skin_y_min            = 4'd2;
                     skin_y_max            = 4'd14;
                     color_threshold_enable = 1'b1;
-                    color_select          = pot_in[15:8];  // 8-bit color selection from potentiometer
-                    color_threshold_value = sw_sync[3:0];  // 4-bit Hamming distance threshold from switches
+                    // Interleaved bits for balanced tuning: Red={15,12,9,6}, Green={14,11,8,5}, Blue={13,10,7,4}
+                    ref_color              = {{pot_in[15], pot_in[12], pot_in[9], pot_in[6]}, 
+                                               {pot_in[14], pot_in[11], pot_in[8], pot_in[5]}, 
+                                               {pot_in[13], pot_in[10], pot_in[7], pot_in[4]}};
+                    color_threshold_value  = sw_sync[5:0];  // 6-bit Manhattan distance threshold from switches (0-45 recommended)
                 end
                 GESTURE: begin
                     // Gesture detection should use the same processed output as BLOB
@@ -1018,9 +1210,82 @@ module control_unit (
                     erosion_enable        = 1'b1;
                     dilation_enable       = 1'b1;
                     centroid_enable       = 1'b1;
+                    split_centroid_enable = 1'b0;
                     blob_filter_enable    = 1'b1;
                     motion_enable         = 1'b0;
                     gesture_enable        = 1'b1;
+                    skin_y_min            = pot_in[15:12];
+                    skin_y_max            = pot_in[11:8];
+                end
+                
+                AUGMENT: begin
+                    // Augment mode: same pipeline as GESTURE but with square overlay
+                    // Square follows centroid when fist detected, otherwise static
+                    grayscale_enable      = 1'b0;
+                    force_color           = 1'b0;
+                    channel_mode_enable   = 1'b0;
+                    channel_select        = 3'b111;
+                    threshold_enable      = 1'b0;
+                    threshold_value       = 4'h0;
+                    median_enable         = 1'b0;
+                    convolution_enable    = 1'b0;
+                    kernel_select         = 2'b00;
+                    skin_threshold_enable = 1'b1;   // activate skin threshold for gesture pipeline
+                    spatial_filter_enable = 1'b1;   // include spatial denoise
+                    erosion_enable        = 1'b1;
+                    dilation_enable       = 1'b1;
+                    centroid_enable       = 1'b1;
+                    split_centroid_enable = 1'b0;
+                    blob_filter_enable    = 1'b1;
+                    motion_enable         = 1'b0;
+                    gesture_enable        = 1'b1;   // Show gesture detection
+                    augment_enable        = 1'b1;   // Enable square overlay
+                    skin_y_min            = pot_in[15:12];
+                    skin_y_max            = pot_in[11:8];
+                end
+                
+                DUAL_CENT: begin
+                    // Dual centroid tracking: full pipeline with erosion+dilation+split_centroid
+                    // pot_in[15:12] = Y_MIN (high-res), pot_in[11:8] = Y_MAX (low-res)
+                    grayscale_enable      = 1'b0;
+                    force_color           = 1'b0;
+                    channel_mode_enable   = 1'b0;
+                    channel_select        = 3'b111;
+                    threshold_enable      = 1'b0;
+                    threshold_value       = 4'h0;
+                    median_enable         = 1'b0;
+                    convolution_enable    = 1'b0;
+                    kernel_select         = 2'b00;
+                    skin_threshold_enable = 1'b1;  // re-enable skin threshold for full pipeline
+                    spatial_filter_enable = 1'b1;  // include spatial denoise upstream
+                    erosion_enable        = 1'b1;
+                    dilation_enable       = 1'b1;
+                    centroid_enable       = 1'b0;  // use split pipeline instead
+                    split_centroid_enable = 1'b1;
+                    motion_enable         = 1'b0;
+                    skin_y_min            = pot_in[15:12];
+                    skin_y_max            = pot_in[11:8];
+                end
+                
+                PONG: begin
+                    // Pong game mode: same pipeline as DUAL_CENT for dual centroid detection
+                    // pot_in[15:12] = Y_MIN (high-res), pot_in[11:8] = Y_MAX (low-res)
+                    grayscale_enable      = 1'b0;
+                    force_color           = 1'b0;
+                    channel_mode_enable   = 1'b0;
+                    channel_select        = 3'b111;
+                    threshold_enable      = 1'b0;
+                    threshold_value       = 4'h0;
+                    median_enable         = 1'b0;
+                    convolution_enable    = 1'b0;
+                    kernel_select         = 2'b00;
+                    skin_threshold_enable = 1'b1;  // re-enable skin threshold for full pipeline
+                    spatial_filter_enable = 1'b1;  // include spatial denoise upstream
+                    erosion_enable        = 1'b1;
+                    dilation_enable       = 1'b1;
+                    centroid_enable       = 1'b0;  // use split pipeline instead
+                    split_centroid_enable = 1'b1;
+                    motion_enable         = 1'b0;
                     skin_y_min            = pot_in[15:12];
                     skin_y_max            = pot_in[11:8];
                 end
@@ -1040,12 +1305,18 @@ module control_unit (
                     erosion_enable      = 1'b0;
                     dilation_enable     = 1'b0;
                     centroid_enable     = 1'b0;
+                    blob_filter_enable  = 1'b0;
+                    split_centroid_enable = 1'b0;
+                    gesture_enable      = 1'b0;
+                    augment_enable      = 1'b0;
+                    dither_enable      = 1'b0;
                     motion_enable       = 1'b0;
                     skin_y_min          = 4'd2;
                     skin_y_max          = 4'd14;
                     color_threshold_enable = 1'b0;
-                    color_select         = 8'h00;
-                    color_threshold_value = 4'h0;
+                    ref_color              = 12'h000;
+                    color_threshold_value  = 6'd0;
+                    temporal_filter_enable = 1'b0;
                 end
             endcase
         end

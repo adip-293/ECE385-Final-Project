@@ -29,17 +29,27 @@ module overlay_manager #(
     input  logic        rst_n,
     input  logic        enable,
     input  logic        bbox_enable,
+    input  logic        use_dual_centroids,
     
     // Centroid coordinates
     input  logic [9:0]  centroid_x,
     input  logic [9:0]  centroid_y,
     input  logic        centroid_valid,
+    // Optional second centroid
+    input  logic [9:0]  centroid2_x,
+    input  logic [9:0]  centroid2_y,
+    input  logic        centroid2_valid,
     
     // Bounding box coordinates
     input  logic [9:0]  bbox_min_x,
     input  logic [9:0]  bbox_min_y,
     input  logic [9:0]  bbox_max_x,
     input  logic [9:0]  bbox_max_y,
+    // Optional second bbox
+    input  logic [9:0]  bbox2_min_x,
+    input  logic [9:0]  bbox2_min_y,
+    input  logic [9:0]  bbox2_max_x,
+    input  logic [9:0]  bbox2_max_y,
     
     // VGA timing
     input  logic [9:0]  draw_x,
@@ -63,17 +73,21 @@ module overlay_manager #(
     localparam logic [2:0] CROSSHAIR_BLUE  = 3'b000;
     
     // Crosshair drawing logic
-    logic draw_crosshair;
-    logic draw_vertical_line;
-    logic draw_horizontal_line;
+    logic draw_crosshair1, draw_crosshair2;
+    logic draw_vertical_line, draw_horizontal_line;
+    logic draw_vertical_line2, draw_horizontal_line2;
     // Bounding box drawing logic
-    logic draw_bbox;
+    logic draw_bbox1, draw_bbox2;
     logic in_bbox_edge;
     logic in_bbox_vertical_edge;
     logic in_bbox_horizontal_edge;
+    logic in_bbox2_edge;
+    logic in_bbox2_vertical_edge;
+    logic in_bbox2_horizontal_edge;
     
     // Check if current pixel is on vertical line of crosshair
     logic [9:0] x_diff, y_diff;
+    logic [9:0] x2_diff, y2_diff;
     logic in_vertical_range, in_horizontal_range;
     logic in_vertical_thickness, in_horizontal_thickness;
     logic outside_center_gap_vertical, outside_center_gap_horizontal;
@@ -82,6 +96,8 @@ module overlay_manager #(
         // Calculate absolute differences
         x_diff = (draw_x >= centroid_x) ? (draw_x - centroid_x) : (centroid_x - draw_x);
         y_diff = (draw_y >= centroid_y) ? (draw_y - centroid_y) : (centroid_y - draw_y);
+        x2_diff = (draw_x >= centroid2_x) ? (draw_x - centroid2_x) : (centroid2_x - draw_x);
+        y2_diff = (draw_y >= centroid2_y) ? (draw_y - centroid2_y) : (centroid2_y - draw_y);
         
         // Vertical line: x matches centroid_x (±thickness), y within range
         in_vertical_thickness = (x_diff < CROSSHAIR_THICKNESS[9:0]);
@@ -92,10 +108,19 @@ module overlay_manager #(
         in_horizontal_thickness = (y_diff < CROSSHAIR_THICKNESS[9:0]);
         in_horizontal_range = (x_diff <= CROSSHAIR_LENGTH[9:0]) && (x_diff >= CENTER_GAP[9:0]);
         draw_horizontal_line = in_horizontal_thickness && in_horizontal_range;
+
+        // Crosshair 2
+        in_vertical_thickness = (x2_diff < CROSSHAIR_THICKNESS[9:0]);
+        in_vertical_range     = (y2_diff <= CROSSHAIR_LENGTH[9:0]) && (y2_diff >= CENTER_GAP[9:0]);
+        draw_vertical_line2   = in_vertical_thickness && in_vertical_range;
+
+        in_horizontal_thickness = (y2_diff < CROSSHAIR_THICKNESS[9:0]);
+        in_horizontal_range     = (x2_diff <= CROSSHAIR_LENGTH[9:0]) && (x2_diff >= CENTER_GAP[9:0]);
+        draw_horizontal_line2   = in_horizontal_thickness && in_horizontal_range;
         
         // Combine: draw crosshair if on either line
-        draw_crosshair = enable && centroid_valid && vde && 
-                        (draw_vertical_line || draw_horizontal_line);
+        draw_crosshair1 = enable && centroid_valid && vde && (draw_vertical_line || draw_horizontal_line);
+        draw_crosshair2 = enable && use_dual_centroids && centroid2_valid && vde && (draw_vertical_line2 || draw_horizontal_line2);
 
         // Bounding box edges: draw rectangle along min/max x/y
         // Vertical edges confined to bbox Y range
@@ -105,12 +130,20 @@ module overlay_manager #(
         in_bbox_horizontal_edge = ((draw_y == bbox_min_y) || (draw_y == bbox_max_y)) &&
                       (draw_x >= bbox_min_x) && (draw_x <= bbox_max_x);
         in_bbox_edge = in_bbox_vertical_edge || in_bbox_horizontal_edge;
-        draw_bbox = bbox_enable && centroid_valid && vde && in_bbox_edge;
+        draw_bbox1   = bbox_enable && centroid_valid && vde && in_bbox_edge;
+
+        // BBox 2
+        in_bbox2_vertical_edge   = ((draw_x == bbox2_min_x) || (draw_x == bbox2_max_x)) &&
+                      (draw_y >= bbox2_min_y) && (draw_y <= bbox2_max_y);
+        in_bbox2_horizontal_edge = ((draw_y == bbox2_min_y) || (draw_y == bbox2_max_y)) &&
+                      (draw_x >= bbox2_min_x) && (draw_x <= bbox2_max_x);
+        in_bbox2_edge = in_bbox2_vertical_edge || in_bbox2_horizontal_edge;
+        draw_bbox2    = bbox_enable && use_dual_centroids && centroid2_valid && vde && in_bbox2_edge;
     end
     
     // Output mux: overlay or passthrough
     always_comb begin
-        if (draw_crosshair || draw_bbox) begin
+        if (draw_crosshair1 || draw_crosshair2 || draw_bbox1 || draw_bbox2) begin
             // Draw crosshair in bright green
             pixel_red_out   = CROSSHAIR_RED;
             pixel_green_out = CROSSHAIR_GREEN;
