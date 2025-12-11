@@ -13,7 +13,8 @@
  *   Hand tracking via split centroid detection controls paddle movement.
  * 
  * Notes:
- *   - Ball physics: bounces off top/bottom walls and paddles
+ *   - Ball physics: bounces off walls and paddles with angle-based deflection
+ *   - Speed increases based on paddle collision count (every N collisions)
  *   - Paddle control: follows centroid Y position when valid
  *   - Score tracking: players score when ball passes opponent's paddle
  *   - Visual feedback: red dots show centroid positions, white paddles, green ball
@@ -29,8 +30,11 @@ module pong #(
     parameter PADDLE_MARGIN         = 5,   // Distance from edge
     parameter CENTER_LINE_DOT_SPACING = 20, // Space between center line dots
     parameter CENTER_LINE_DOT_SIZE  = 4,
-    parameter BALL_SPEED_X          = 3,    // Pixels per frame
-    parameter BALL_SPEED_Y          = 2     // Pixels per frame
+    parameter BALL_SPEED_X          = 3,    // Base pixels per frame
+    parameter BALL_SPEED_Y          = 2,    // Base pixels per frame
+    parameter SPEED_WAVE_INTERVAL  = 2,    // Increase speed every N paddle collisions
+    parameter MAX_SPEED_X           = 8,    // Maximum X speed
+    parameter MAX_SPEED_Y           = 6     // Maximum Y speed
 )(
     // System
     input  logic        clk,
@@ -45,6 +49,9 @@ module pong #(
     
     // Reset/rematch button
     input  logic        rematch_pressed,  // btn[0] pressed for rematch
+    
+    // Random number input (from potentiometer noise)
+    input  logic [3:0]  rng,              // 4-bit random value from pot[3:0]
 
     // Centroid inputs for paddle control
     input  logic [9:0]  left_centroid_y,   // Left player paddle Y position
@@ -97,8 +104,8 @@ module pong #(
     logic [9:0] ball_x, ball_y;
     logic [9:0] left_paddle_center;
     logic [9:0] right_paddle_center;
-    logic [9:0] Ball_X_Motion;
-    logic [9:0] Ball_Y_Motion;
+    logic signed [10:0] Ball_X_Motion;  // Signed for direction
+    logic signed [10:0] Ball_Y_Motion;  // Signed for direction
     logic       next_turn;
     logic       player_a_win;
     logic       player_b_win;
@@ -106,6 +113,13 @@ module pong #(
     logic [3:0] player_b_score;
     logic       player_a_wins;
     logic       player_b_wins;
+    
+    // Speed tracking system
+    logic [4:0] paddle_collision_count;  // Count total paddle collisions
+    logic [3:0] current_speed_level;      // Current speed wave (0-15)
+    logic [9:0] current_speed_x;          // Current X speed magnitude
+    logic [9:0] current_speed_y;          // Current Y speed magnitude
+    logic       paddle_collision_this_frame;  // Collision detected this frame
 
     // ------------------------------------------------------------
     // Frame Start Edge Detection
@@ -124,45 +138,217 @@ module pong #(
     assign frame_start_edge = frame_start & ~frame_start_prev;
 
     // ------------------------------------------------------------
+    // Speed Calculation
+    // ------------------------------------------------------------
+    // Compute current speed magnitude based on collision count
+    always_comb begin
+        // Speed level increases every SPEED_WAVE_INTERVAL collisions
+        current_speed_level = paddle_collision_count / SPEED_WAVE_INTERVAL;
+        
+        // Calculate speed magnitude: base speed + level increment, clamped to maximum
+        if ((BALL_SPEED_X + current_speed_level) > MAX_SPEED_X) begin
+            current_speed_x = MAX_SPEED_X;
+        end else begin
+            current_speed_x = BALL_SPEED_X + current_speed_level;
+        end
+        
+        if ((BALL_SPEED_Y + current_speed_level) > MAX_SPEED_Y) begin
+            current_speed_y = MAX_SPEED_Y;
+        end else begin
+            current_speed_y = BALL_SPEED_Y + current_speed_level;
+        end
+    end
+
+    // ------------------------------------------------------------
     // Ball Physics: Motion Calculation
     // ------------------------------------------------------------
-    logic [9:0] Ball_X_Motion_next;
-    logic [9:0] Ball_Y_Motion_next;
+    logic signed [10:0] Ball_X_Motion_next;
+    logic signed [10:0] Ball_Y_Motion_next;
     logic [9:0] Ball_X_next;
     logic [9:0] Ball_Y_next;
+    
+    // Paddle collision detection with angle-based deflection
+    logic signed [10:0] paddle_relative_y;  // Ball Y relative to paddle center
+    logic signed [10:0] angle_factor;       // Calculated deflection factor
+    logic signed [10:0] deflection_y;       // Y velocity adjustment based on hit position
+    logic signed [10:0] paddle_half_height;  // Half paddle height for calculations
+    
+    // Random initial ball motion calculation
+    logic signed [10:0] random_x_motion;
+    logic signed [10:0] random_y_motion;
+    logic [9:0] speed_y_plus_one;  // BALL_SPEED_Y + 1 for variation
+    
+    assign speed_y_plus_one = BALL_SPEED_Y + 1;
+    
+    always_comb begin
+        // Randomize X direction using rng[0]
+        if (rng[0]) begin
+            random_x_motion = $signed({1'b0, BALL_SPEED_X[9:0]});
+        end else begin
+            random_x_motion = -$signed({1'b0, BALL_SPEED_X[9:0]});
+        end
+        
+        // Randomize Y direction and add slight speed variation using rng[3:1]
+        case (rng[2:1])
+            2'b00: begin
+                random_y_motion = -$signed({1'b0, BALL_SPEED_Y});
+            end
+            2'b01: begin
+                random_y_motion = $signed({1'b0, BALL_SPEED_Y});
+            end
+            2'b10: begin
+                if (rng[3]) begin
+                    random_y_motion = -$signed({1'b0, speed_y_plus_one});
+                end else begin
+                    random_y_motion = -$signed({1'b0, BALL_SPEED_Y});
+                end
+            end
+            2'b11: begin
+                if (rng[3]) begin
+                    random_y_motion = $signed({1'b0, speed_y_plus_one});
+                end else begin
+                    random_y_motion = $signed({1'b0, BALL_SPEED_Y});
+                end
+            end
+        endcase
+    end
 
     always_comb begin
         // Default: maintain current motion
         Ball_X_Motion_next = Ball_X_Motion;
         Ball_Y_Motion_next = Ball_Y_Motion;
+        paddle_collision_this_frame = 1'b0;
+        deflection_y = 11'sd0;
 
         // Top wall collision
         if ((ball_y - BALL_SIZE) <= BALL_Y_MIN) begin
-            Ball_Y_Motion_next = BALL_SPEED_Y[9:0];
+            Ball_Y_Motion_next = $signed({1'b0, current_speed_y[9:0]});
         end
         // Bottom wall collision
         else if ((ball_y + BALL_SIZE) >= BALL_Y_MAX) begin
-            Ball_Y_Motion_next = (~(BALL_SPEED_Y[9:0]) + 1'b1);  // Negate via 2's complement
+            Ball_Y_Motion_next = -$signed({1'b0, current_speed_y[9:0]});
         end
-
-        // Right paddle collision
-        if (((ball_x + BALL_SIZE) < (RIGHT_PADDLE_X - PADDLE_WIDTH) + BALL_SPEED_X) &&
-            ((ball_x + BALL_SIZE) > (RIGHT_PADDLE_X - PADDLE_WIDTH) - BALL_SPEED_X) &&
-            (ball_y > right_paddle_center - (PADDLE_HEIGHT >> 1)) &&
-            (ball_y < right_paddle_center + (PADDLE_HEIGHT >> 1))) begin
-            Ball_X_Motion_next = (~(BALL_SPEED_X[9:0]) + 1'b1);  // Bounce left
+        // Right paddle collision with angle-based deflection
+        else if ((ball_x + BALL_SIZE) >= (RIGHT_PADDLE_X - PADDLE_WIDTH) &&
+                 (ball_x - BALL_SIZE) <= (RIGHT_PADDLE_X + PADDLE_WIDTH) &&
+                 (ball_y > right_paddle_center - (PADDLE_HEIGHT >> 1) - BALL_SIZE) &&
+                 (ball_y < right_paddle_center + (PADDLE_HEIGHT >> 1) + BALL_SIZE) &&
+                 (Ball_X_Motion > 0)) begin  // Only if moving right
+            
+            paddle_collision_this_frame = 1'b1;
+            
+            // Calculate relative position on paddle (-PADDLE_HEIGHT/2 to +PADDLE_HEIGHT/2)
+            paddle_relative_y = $signed({1'b0, ball_y}) - $signed({1'b0, right_paddle_center});
+            
+            // Calculate deflection based on hit position (simplified, no division)
+            // Map relative_y (-PADDLE_HEIGHT/2 to +PADDLE_HEIGHT/2) to deflection
+            // Use multiplication and shift instead of division for efficiency
+            paddle_half_height = $signed({1'b0, (PADDLE_HEIGHT >> 1)});
+            
+            // Scale relative_y to deflection range: multiply by speed, divide by paddle_half
+            // Approximate: deflection = (relative_y * current_speed_y) / paddle_half_height
+            // Use: deflection = (relative_y * current_speed_y) >> log2(paddle_half_height)
+            // For PADDLE_HEIGHT=80, half=40, log2(40)≈5.3, use 5
+            if (paddle_relative_y > 0) begin
+                // Hit on bottom half - deflect downward
+                angle_factor = (paddle_relative_y * $signed({1'b0, current_speed_y})) >>> 5;  // Approximate division by 40
+                if (angle_factor > $signed({1'b0, current_speed_y})) begin
+                    angle_factor = $signed({1'b0, current_speed_y});
+                end
+                deflection_y = angle_factor;
+            end else begin
+                // Hit on top half - deflect upward
+                angle_factor = (paddle_relative_y * $signed({1'b0, current_speed_y})) >>> 5;
+                if (angle_factor < -$signed({1'b0, current_speed_y})) begin
+                    angle_factor = -$signed({1'b0, current_speed_y});
+                end
+                deflection_y = angle_factor;
+            end
+            
+            // Reverse X direction and add deflection
+            Ball_X_Motion_next = -$signed(current_speed_x[9:0]);
+            // Add angle-based Y deflection (preserve some existing Y motion for spin effect)
+            Ball_Y_Motion_next = deflection_y + (Ball_Y_Motion >>> 1);  // Mix old and new
+            
+            // Clamp Y motion to max speed
+            if (Ball_Y_Motion_next > $signed({1'b0, current_speed_y})) begin
+                Ball_Y_Motion_next = $signed({1'b0, current_speed_y});
+            end else if (Ball_Y_Motion_next < -$signed({1'b0, current_speed_y})) begin
+                Ball_Y_Motion_next = -$signed({1'b0, current_speed_y});
+            end
         end
-        // Left paddle collision
-        else if (((ball_x - BALL_SIZE) < (LEFT_PADDLE_X + PADDLE_WIDTH) + BALL_SPEED_X) &&
-                 ((ball_x - BALL_SIZE) > (LEFT_PADDLE_X + PADDLE_WIDTH) - BALL_SPEED_X) &&
-                 (ball_y > left_paddle_center - (PADDLE_HEIGHT >> 1)) &&
-                 (ball_y < left_paddle_center + (PADDLE_HEIGHT >> 1))) begin
-            Ball_X_Motion_next = BALL_SPEED_X[9:0];  // Bounce right
+        // Left paddle collision with angle-based deflection
+        else if ((ball_x - BALL_SIZE) <= (LEFT_PADDLE_X + PADDLE_WIDTH) &&
+                 (ball_x + BALL_SIZE) >= (LEFT_PADDLE_X - PADDLE_WIDTH) &&
+                 (ball_y > left_paddle_center - (PADDLE_HEIGHT >> 1) - BALL_SIZE) &&
+                 (ball_y < left_paddle_center + (PADDLE_HEIGHT >> 1) + BALL_SIZE) &&
+                 (Ball_X_Motion < 0)) begin  // Only if moving left
+            
+            paddle_collision_this_frame = 1'b1;
+            
+            // Calculate relative position on paddle
+            paddle_relative_y = $signed({1'b0, ball_y}) - $signed({1'b0, left_paddle_center});
+            
+            // Calculate deflection (same as right paddle)
+            paddle_half_height = $signed({1'b0, (PADDLE_HEIGHT >> 1)});
+            
+            if (paddle_relative_y > 0) begin
+                angle_factor = (paddle_relative_y * $signed({1'b0, current_speed_y})) >>> 5;
+                if (angle_factor > $signed({1'b0, current_speed_y})) begin
+                    angle_factor = $signed({1'b0, current_speed_y});
+                end
+                deflection_y = angle_factor;
+            end else begin
+                angle_factor = (paddle_relative_y * $signed({1'b0, current_speed_y})) >>> 5;
+                if (angle_factor < -$signed({1'b0, current_speed_y})) begin
+                    angle_factor = -$signed({1'b0, current_speed_y});
+                end
+                deflection_y = angle_factor;
+            end
+            
+            // Reverse X direction and add deflection
+            Ball_X_Motion_next = $signed(current_speed_x[9:0]);
+            Ball_Y_Motion_next = deflection_y + (Ball_Y_Motion >>> 1);
+            
+            // Clamp Y motion
+            if (Ball_Y_Motion_next > $signed({1'b0, current_speed_y})) begin
+                Ball_Y_Motion_next = $signed({1'b0, current_speed_y});
+            end else if (Ball_Y_Motion_next < -$signed({1'b0, current_speed_y})) begin
+                Ball_Y_Motion_next = -$signed({1'b0, current_speed_y});
+            end
         end
     end
 
-    assign Ball_X_next = ball_x + Ball_X_Motion_next;
-    assign Ball_Y_next = ball_y + Ball_Y_Motion_next;
+    // Update ball position with signed motion and wall clamping
+    always_comb begin
+        // X position update
+        if (Ball_X_Motion_next[10]) begin  // Negative (moving left)
+            Ball_X_next = ball_x - (~Ball_X_Motion_next[9:0] + 1'b1);
+        end else begin
+            Ball_X_next = ball_x + Ball_X_Motion_next[9:0];
+        end
+        
+        // Clamp X to screen bounds
+        if (Ball_X_next < BALL_SIZE) begin
+            Ball_X_next = BALL_SIZE;
+        end else if (Ball_X_next > (BALL_X_MAX - BALL_SIZE)) begin
+            Ball_X_next = BALL_X_MAX - BALL_SIZE;
+        end
+        
+        // Y position update
+        if (Ball_Y_Motion_next[10]) begin  // Negative (moving up)
+            Ball_Y_next = ball_y - (~Ball_Y_Motion_next[9:0] + 1'b1);
+        end else begin
+            Ball_Y_next = ball_y + Ball_Y_Motion_next[9:0];
+        end
+        
+        // Clamp Y to screen bounds (prevents ball from vanishing at top/bottom)
+        if (Ball_Y_next < BALL_SIZE) begin
+            Ball_Y_next = BALL_SIZE;
+        end else if (Ball_Y_next > (BALL_Y_MAX - BALL_SIZE)) begin
+            Ball_Y_next = BALL_Y_MAX - BALL_SIZE;
+        end
+    end
 
     // ------------------------------------------------------------
     // Rematch button edge detection
@@ -190,8 +376,10 @@ module pong #(
             ball_y <= BALL_Y_CENTER;
             left_paddle_center <= FRAME_HEIGHT >> 1;
             right_paddle_center <= FRAME_HEIGHT >> 1;
-            Ball_X_Motion <= BALL_SPEED_X[9:0];
-            Ball_Y_Motion <= BALL_SPEED_Y[9:0];
+            
+            // Randomize initial ball direction using RNG
+            Ball_X_Motion <= random_x_motion;
+            Ball_Y_Motion <= random_y_motion;
             player_a_win <= 1'b0;
             player_b_win <= 1'b0;
             player_a_score <= 4'd0;
@@ -199,14 +387,25 @@ module pong #(
             player_a_wins <= 1'b0;
             player_b_wins <= 1'b0;
             next_turn <= 1'b0;
+            paddle_collision_count <= 5'd0;
+            current_speed_level <= 4'd0;
         end else if (enable && frame_start_edge) begin
+            // Increment collision counter when paddle hit detected
+            if (paddle_collision_this_frame) begin
+                paddle_collision_count <= paddle_collision_count + 5'd1;
+            end
+            
             // Check for score conditions
             if (ball_x > RIGHT_LOSS_X) begin
                 next_turn <= 1'b1;
                 player_a_win <= 1'b1;
+                // Reset collision count on score (speed resets)
+                paddle_collision_count <= 5'd0;
             end else if (ball_x < LEFT_LOSS_X) begin
                 next_turn <= 1'b1;
                 player_b_win <= 1'b1;
+                // Reset collision count on score
+                paddle_collision_count <= 5'd0;
             end
 
             // Handle new turn (reset ball after score)
@@ -225,9 +424,9 @@ module pong #(
                         end
                     end
                     player_a_win <= 1'b0;
-                    // Reset ball motion
-                    Ball_X_Motion <= BALL_SPEED_X[9:0];
-                    Ball_Y_Motion <= BALL_SPEED_Y[9:0];
+                    // Randomize ball motion for new turn
+                    Ball_X_Motion <= random_x_motion;
+                    Ball_Y_Motion <= random_y_motion;
                 end else if (player_b_win) begin
                     if (player_b_score < 4'd7) begin
                         player_b_score <= player_b_score + 1'b1;
@@ -237,9 +436,9 @@ module pong #(
                         end
                     end
                     player_b_win <= 1'b0;
-                    // Reset ball motion
-                    Ball_X_Motion <= BALL_SPEED_X[9:0];
-                    Ball_Y_Motion <= BALL_SPEED_Y[9:0];
+                    // Randomize ball motion for new turn
+                    Ball_X_Motion <= random_x_motion;
+                    Ball_Y_Motion <= random_y_motion;
                 end
             end else begin
                 // Normal game update
@@ -322,7 +521,7 @@ module pong #(
                                  (draw_x > CENTER_LINE_L) &&
                                  (draw_y[4] == 1'b1);  // Every 16 pixels
 
-            // Green ball
+            // Green ball (circular approximation with square)
             ball_pixel <= (draw_x < ball_x + BALL_SIZE) &&
                           (draw_x > ball_x - BALL_SIZE) &&
                           (draw_y < ball_y + BALL_SIZE) &&
@@ -368,3 +567,4 @@ module pong #(
 end
 
 endmodule
+

@@ -48,8 +48,8 @@ module preprocessor (
     input  logic [3:0]  skin_y_min,
     input  logic [3:0]  skin_y_max,
     input  logic        color_threshold_enable,
-    input  logic [7:0]  color_select,
-    input  logic [3:0]  color_threshold_value,
+    input  logic [11:0] ref_color,           // Reference color {R[3:0], G[3:0], B[3:0]}
+    input  logic [5:0]  color_threshold_value, // Manhattan distance threshold (0-45)
     input  logic        learning_mode,      // sw[13]: Enable learning mode
     input  logic [2:0]  learning_buttons,   // btn[2:0] for teaching in learning mode
     
@@ -155,7 +155,7 @@ module preprocessor (
         .r_in(cam_pix_data[11:8]),
         .g_in(cam_pix_data[7:4]),
         .b_in(cam_pix_data[3:0]),
-        .color_select(color_select),
+        .ref_color(ref_color),
         .threshold(color_threshold_value),
         .mask_pixel(color_mask_pixel)
     );

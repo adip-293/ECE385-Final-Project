@@ -41,7 +41,9 @@ module postprocessor #(
     input  logic        force_grayscale,
     input  logic [4:0]  current_state,
     input  logic        gesture_enable,
+    input  logic        augment_enable,
     input  logic        split_centroid_enable,
+    input  logic        dither_type,           // Dither type: 0=ordered, 1=Bayer (for text overlay)
     
     // VGA timing
     input  logic [9:0]  draw_x,
@@ -79,7 +81,9 @@ module postprocessor #(
     
     // Button inputs for pong reset
     input  logic [2:0]  btn_sync,
-    //input switches
+    
+    // Random number input for pong (from potentiometer noise)
+    input  logic [3:0]  rng,
     
     // Input pixels from buffer
     input  logic [2:0]  pixel_red_in,
@@ -102,7 +106,7 @@ module postprocessor #(
     
     // Pong enable signal
     logic pong_enable;
-    assign pong_enable = (current_state == 5'd21);  // PONG state
+    assign pong_enable = (current_state == 5'd22);  // PONG state
     
     // Rematch button edge detection for pong (btn[0] in PONG state)
     logic btn0_prev;
@@ -259,6 +263,9 @@ module postprocessor #(
         .force_color(force_color),
         .force_grayscale(force_grayscale),
         .gesture_code(gesture_code_lat),
+        .dither_type(dither_type),
+        .channel_mode_enable(channel_mode_enable),
+        .channel_select(channel_select),
         
         // Pong score inputs (for large score display)
         .pong_player_a_score(pong_player_a_score),
@@ -331,8 +338,51 @@ module postprocessor #(
         .pixel_blue_out(blue_after_overlay)
     );
 
+    // Gesture text already integrated in main text overlay; pass-through
+    
     // ------------------------------------------------------------
-    // Stage 4: Pong Game
+    // Stage 4: Augment (Square Overlay)
+    // ------------------------------------------------------------
+    // Draws square overlay that follows centroid when fist detected
+    logic [2:0] red_after_augment, green_after_augment, blue_after_augment;
+    
+    augment #(
+        .FRAME_WIDTH(FRAME_WIDTH),
+        .FRAME_HEIGHT(FRAME_HEIGHT),
+        .SQUARE_SIZE(80)
+    ) augment_module (
+        .clk(clk),
+        .rst_n(rst_n),
+        .enable(augment_enable),
+        
+        // Centroid inputs
+        .centroid_x(centroid_x),
+        .centroid_y(centroid_y),
+        .centroid_valid(centroid_valid),
+        
+        // Gesture inputs
+        .gesture_fist(gesture_fist),
+        .gesture_open(gesture_open),
+        .gesture_wave(gesture_wave),
+        
+        // VGA timing
+        .draw_x(draw_x),
+        .draw_y(draw_y),
+        .vde(vde),
+        
+        // Input pixels (from overlay manager)
+        .pixel_red_in(red_after_overlay),
+        .pixel_green_in(green_after_overlay),
+        .pixel_blue_in(blue_after_overlay),
+        
+        // Output pixels (with square overlay)
+        .pixel_red_out(red_after_augment),
+        .pixel_green_out(green_after_augment),
+        .pixel_blue_out(blue_after_augment)
+    );
+    
+    // ------------------------------------------------------------
+    // Stage 5: Pong Game
     // ------------------------------------------------------------
     // Draws pong game when in PONG state
     logic [2:0] red_after_pong, green_after_pong, blue_after_pong;
@@ -358,6 +408,9 @@ module postprocessor #(
         // Reset/rematch button
         .rematch_pressed(pong_rematch_pressed),
         
+        // Random number input (from potentiometer noise)
+        .rng(rng),
+        
         // Centroid inputs for paddle control
         .left_centroid_y(left_centroid_y),
         .left_centroid_valid(left_centroid_valid),
@@ -368,10 +421,10 @@ module postprocessor #(
         .left_centroid_x(left_centroid_x),
         .right_centroid_x(right_centroid_x),
         
-        // Input pixels (from overlay manager)
-        .pixel_red_in(red_after_overlay),
-        .pixel_green_in(green_after_overlay),
-        .pixel_blue_in(blue_after_overlay),
+        // Input pixels (from augment, or overlay manager if augment disabled)
+        .pixel_red_in(augment_enable ? red_after_augment : red_after_overlay),
+        .pixel_green_in(augment_enable ? green_after_augment : green_after_overlay),
+        .pixel_blue_in(augment_enable ? blue_after_augment : blue_after_overlay),
         
         // Output pixels
         .pixel_red_out(red_after_pong),
@@ -387,16 +440,16 @@ module postprocessor #(
         .player_b_wins(pong_player_b_wins)
     );
     
-    // Final output: pong when enabled, otherwise overlay manager output
+    // Final output: pong when enabled, otherwise augment or overlay manager output
     always_comb begin
         if (pong_enable) begin
             pixel_red_out = red_after_pong;
             pixel_green_out = green_after_pong;
             pixel_blue_out = blue_after_pong;
         end else begin
-            pixel_red_out = red_after_overlay;
-            pixel_green_out = green_after_overlay;
-            pixel_blue_out = blue_after_overlay;
+            pixel_red_out = augment_enable ? red_after_augment : red_after_overlay;
+            pixel_green_out = augment_enable ? green_after_augment : green_after_overlay;
+            pixel_blue_out = augment_enable ? blue_after_augment : blue_after_overlay;
         end
     end
 

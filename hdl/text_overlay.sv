@@ -18,10 +18,13 @@
 module text_overlay (
     input  logic        clk,
     input  logic        rst_n,
-    input  logic [4:0]  current_state,    // 5-bit state (0-19)
+    input  logic [4:0]  current_state,    // 5-bit state (0-22)
     input  logic        force_color,      // Force color override
     input  logic        force_grayscale,  // Force grayscale override
     input  logic [1:0]  gesture_code,     // 0=none,1=FIST,2=OPEN,3=WAVE (latched per frame)
+    input  logic        dither_type,     // 0=ordered/simple, 1=Bayer (for DITHER state indicator)
+    input  logic        channel_mode_enable, // Enable channel selection mode
+    input  logic [2:0]  channel_select,     // Channel selection: {R, G, B} (for CHANNEL_MODE state indicator)
     input  logic [3:0]  pong_player_a_score,  // Player A score (0-7) for large display
     input  logic [3:0]  pong_player_b_score,  // Player B score (0-7) for large display
     input  logic        pong_player_a_wins,   // Player A wins flag
@@ -57,55 +60,59 @@ module text_overlay (
     
     // State name strings (as ASCII codes)
     // Reordered to place DILATE before CENTROID for sequential morphology
-    // Indices must match control_unit enumeration values (0..21)
-    logic [7:0] state_text [0:21][0:MAX_TEXT_LEN-1];
+    // Indices must match control_unit enumeration values (0..23)
+    logic [7:0] state_text [0:23][0:MAX_TEXT_LEN-1];
     
     // Initialize state text strings
     initial begin
         // State 0: RAW
         state_text[0] = '{8'd82, 8'd65, 8'd87, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "RAW             "
-        // State 1: CHANNEL_MODE
-        state_text[1] = '{8'd67, 8'd72, 8'd65, 8'd78, 8'd78, 8'd69, 8'd76, 8'd32, 8'd77, 8'd79, 8'd68, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32};  // "CHANNEL MODE    "
-        // State 2: GRAYSCALE
-        state_text[2] = '{8'd71, 8'd82, 8'd65, 8'd89, 8'd83, 8'd67, 8'd65, 8'd76, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "GRAYSCALE       "
-        // State 3: THRESHOLD
-        state_text[3] = '{8'd84, 8'd72, 8'd82, 8'd69, 8'd83, 8'd72, 8'd79, 8'd76, 8'd68, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "THRESHOLD       "
-        // State 4: TEMPORAL
-        state_text[4] = '{8'd84, 8'd69, 8'd77, 8'd80, 8'd79, 8'd82, 8'd65, 8'd76, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "TEMPORAL        "
-        // State 5: MEDIAN
-        state_text[5] = '{8'd77, 8'd69, 8'd68, 8'd73, 8'd65, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "MEDIAN          "
-        // State 6: GAUSSIAN
-        state_text[6] = '{8'd71, 8'd65, 8'd85, 8'd83, 8'd83, 8'd73, 8'd65, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "GAUSSIAN        "
-        // State 7: SOBEL
-        state_text[7] = '{8'd83, 8'd79, 8'd66, 8'd69, 8'd76, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "SOBEL           "
-        // State 8: SHARPEN
-        state_text[8] = '{8'd83, 8'd72, 8'd65, 8'd82, 8'd80, 8'd69, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "SHARPEN         "
-        // State 9: EMBOSS
-        state_text[9] = '{8'd69, 8'd77, 8'd66, 8'd79, 8'd83, 8'd83, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "EMBOSS          "
-        // State 10: SKIN
-        state_text[10] = '{8'd83, 8'd75, 8'd73, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "SKIN            "
-        // State 11: SPATIAL
-        state_text[11] = '{8'd83, 8'd80, 8'd65, 8'd84, 8'd73, 8'd65, 8'd76, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "SPATIAL         "
-        // State 12: ERODE
-        state_text[12] = '{8'd69, 8'd82, 8'd79, 8'd68, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "ERODE           "
-        // State 13: DILATE
-        state_text[13] = '{8'd68, 8'd73, 8'd76, 8'd65, 8'd84, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "DILATE          "
-        // State 14: CENTROID
-        state_text[14] = '{8'd67, 8'd69, 8'd78, 8'd84, 8'd82, 8'd79, 8'd73, 8'd68, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "CENTROID        "
-        // State 15: BLOB FILTER
-        state_text[15] = '{8'd66, 8'd76, 8'd79, 8'd66, 8'd32, 8'd70, 8'd73, 8'd76, 8'd84, 8'd69, 8'd82, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "BLOB FILTER     "
-        // State 16: SKIN MOTION
-        state_text[16] = '{8'd83, 8'd75, 8'd73, 8'd78, 8'd32, 8'd77, 8'd79, 8'd84, 8'd73, 8'd79, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "SKIN MOTION     "
-        // State 17: COLOR THRESH
-        state_text[17] = '{8'd67, 8'd79, 8'd76, 8'd79, 8'd82, 8'd32, 8'd84, 8'd72, 8'd82, 8'd69, 8'd83, 8'd72, 8'd32, 8'd32, 8'd32, 8'd32}; // "COLOR THRESH    "
-        // State 18: COLOR TRACK
-        state_text[18] = '{8'd67, 8'd79, 8'd76, 8'd79, 8'd82, 8'd32, 8'd84, 8'd82, 8'd65, 8'd67, 8'd75, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "COLOR TRACK     "
-        // State 19: GESTURE
-        state_text[19] = '{8'd71, 8'd69, 8'd83, 8'd84, 8'd85, 8'd82, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "GESTURE         "
-        // State 20: DUAL CENTROID
-        state_text[20] = '{8'd68, 8'd85, 8'd65, 8'd76, 8'd32, 8'd67, 8'd69, 8'd78, 8'd84, 8'd82, 8'd79, 8'd73, 8'd68, 8'd32, 8'd32, 8'd32}; // "DUAL CENTROID   "
-        // State 21: PONG
-        state_text[21] = '{8'd80, 8'd79, 8'd78, 8'd71, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "PONG            "
+        // State 1: DITHER
+        state_text[1] = '{8'd68, 8'd73, 8'd84, 8'd72, 8'd69, 8'd82, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "DITHER          "
+        // State 2: CHANNEL_MODE
+        state_text[2] = '{8'd67, 8'd72, 8'd65, 8'd78, 8'd78, 8'd69, 8'd76, 8'd32, 8'd77, 8'd79, 8'd68, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32};  // "CHANNEL MODE    "
+        // State 3: GRAYSCALE
+        state_text[3] = '{8'd71, 8'd82, 8'd65, 8'd89, 8'd83, 8'd67, 8'd65, 8'd76, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "GRAYSCALE       "
+        // State 4: THRESHOLD
+        state_text[4] = '{8'd84, 8'd72, 8'd82, 8'd69, 8'd83, 8'd72, 8'd79, 8'd76, 8'd68, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "THRESHOLD       "
+        // State 5: TEMPORAL
+        state_text[5] = '{8'd84, 8'd69, 8'd77, 8'd80, 8'd79, 8'd82, 8'd65, 8'd76, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "TEMPORAL        "
+        // State 6: MEDIAN
+        state_text[6] = '{8'd77, 8'd69, 8'd68, 8'd73, 8'd65, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "MEDIAN          "
+        // State 7: GAUSSIAN
+        state_text[7] = '{8'd71, 8'd65, 8'd85, 8'd83, 8'd83, 8'd73, 8'd65, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "GAUSSIAN        "
+        // State 8: SOBEL
+        state_text[8] = '{8'd83, 8'd79, 8'd66, 8'd69, 8'd76, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "SOBEL           "
+        // State 9: SHARPEN
+        state_text[9] = '{8'd83, 8'd72, 8'd65, 8'd82, 8'd80, 8'd69, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "SHARPEN         "
+        // State 10: EMBOSS
+        state_text[10] = '{8'd69, 8'd77, 8'd66, 8'd79, 8'd83, 8'd83, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "EMBOSS          "
+        // State 11: SKIN
+        state_text[11] = '{8'd83, 8'd75, 8'd73, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32};  // "SKIN            "
+        // State 12: SPATIAL
+        state_text[12] = '{8'd83, 8'd80, 8'd65, 8'd84, 8'd73, 8'd65, 8'd76, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "SPATIAL         "
+        // State 13: ERODE
+        state_text[13] = '{8'd69, 8'd82, 8'd79, 8'd68, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "ERODE           "
+        // State 14: DILATE
+        state_text[14] = '{8'd68, 8'd73, 8'd76, 8'd65, 8'd84, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "DILATE          "
+        // State 15: CENTROID
+        state_text[15] = '{8'd67, 8'd69, 8'd78, 8'd84, 8'd82, 8'd79, 8'd73, 8'd68, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "CENTROID        "
+        // State 16: BLOB FILTER
+        state_text[16] = '{8'd66, 8'd76, 8'd79, 8'd66, 8'd32, 8'd70, 8'd73, 8'd76, 8'd84, 8'd69, 8'd82, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "BLOB FILTER     "
+        // State 17: SKIN MOTION
+        state_text[17] = '{8'd83, 8'd75, 8'd73, 8'd78, 8'd32, 8'd77, 8'd79, 8'd84, 8'd73, 8'd79, 8'd78, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "SKIN MOTION     "
+        // State 18: COLOR THRESH
+        state_text[18] = '{8'd67, 8'd79, 8'd76, 8'd79, 8'd82, 8'd32, 8'd84, 8'd72, 8'd82, 8'd69, 8'd83, 8'd72, 8'd32, 8'd32, 8'd32, 8'd32}; // "COLOR THRESH    "
+        // State 19: COLOR TRACK
+        state_text[19] = '{8'd67, 8'd79, 8'd76, 8'd79, 8'd82, 8'd32, 8'd84, 8'd82, 8'd65, 8'd67, 8'd75, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "COLOR TRACK     "
+        // State 20: GESTURE
+        state_text[20] = '{8'd71, 8'd69, 8'd83, 8'd84, 8'd85, 8'd82, 8'd69, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "GESTURE         "
+        // State 21: DUAL CENTROID
+        state_text[21] = '{8'd68, 8'd85, 8'd65, 8'd76, 8'd32, 8'd67, 8'd69, 8'd78, 8'd84, 8'd82, 8'd79, 8'd73, 8'd68, 8'd32, 8'd32, 8'd32}; // "DUAL CENTROID   "
+        // State 22: PONG
+        state_text[22] = '{8'd80, 8'd79, 8'd78, 8'd71, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "PONG            "
+        // State 23: AUGMENT
+        state_text[23] = '{8'd65, 8'd85, 8'd71, 8'd77, 8'd69, 8'd78, 8'd84, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32, 8'd32}; // "AUGMENT         "
     end
     
     // Font ROM interface
@@ -141,7 +148,7 @@ module text_overlay (
         if (force_color) begin
             display_state = 5'd0;  // Show "RAW"
         end else if (force_grayscale) begin
-            display_state = 5'd2;  // Show "GRAYSCALE"
+            display_state = 5'd3;  // Show "GRAYSCALE"
         end else begin
             display_state = current_state;  // Show current state
         end
@@ -155,10 +162,31 @@ module text_overlay (
         gesture_word[2] = '{8'd79, 8'd80, 8'd69, 8'd78}; // OPEN
         gesture_word[3] = '{8'd87, 8'd65, 8'd86, 8'd69}; // WAVE
     end
+    
+    // Dither type words for bottom-right overlay (ORDER, BAYER)
+    logic [7:0] dither_word [0:1][0:4];  // 5 characters each
+    initial begin
+        dither_word[0] = '{8'd79, 8'd82, 8'd68, 8'd69, 8'd82}; // ORDER
+        dither_word[1] = '{8'd66, 8'd65, 8'd89, 8'd69, 8'd82}; // BAYER
+    end
+    
+    // Channel selector words for bottom-right overlay (RGB, _GB, R_B, RG_, R__, _G_, __B, ___)
+    // channel_select encoding: [2]=R, [1]=G, [0]=B
+    logic [7:0] channel_word [0:7][0:3];  // 4 characters each
+    initial begin
+        channel_word[0] = '{8'd95, 8'd95, 8'd95, 8'd32}; // ___ (none: 3'b000)
+        channel_word[1] = '{8'd95, 8'd95, 8'd66, 8'd32}; // __B (B only: 3'b001)
+        channel_word[2] = '{8'd95, 8'd71, 8'd95, 8'd32}; // _G_ (G only: 3'b010)
+        channel_word[3] = '{8'd95, 8'd71, 8'd66, 8'd32}; // _GB (GB: 3'b011)
+        channel_word[4] = '{8'd82, 8'd95, 8'd95, 8'd32}; // R__ (R only: 3'b100)
+        channel_word[5] = '{8'd82, 8'd95, 8'd66, 8'd32}; // R_B (RB: 3'b101)
+        channel_word[6] = '{8'd82, 8'd71, 8'd95, 8'd32}; // RG_ (RG: 3'b110)
+        channel_word[7] = '{8'd82, 8'd71, 8'd66, 8'd32}; // RGB (all: 3'b111)
+    end
 
-    // Safe state index
+    // Safe state index (clamp to valid range 0-23)
     logic [4:0] safe_display_state;
-    assign safe_display_state = (display_state > 5'd21) ? 5'd0 : display_state;
+    assign safe_display_state = (display_state > 5'd23) ? 5'd0 : display_state;
 
     // Always take characters from state text row (no inline gesture word insertion now)
     always_comb begin
@@ -184,14 +212,62 @@ module text_overlay (
     assign gesture_pixel_col  = (draw_x - GESTURE_X_START) % CHAR_WIDTH;
     assign gesture_char       = gesture_word[gesture_code][gesture_char_index];
     assign gesture_font_addr  = {gesture_char[6:0], pixel_row};
+    
+    // Bottom-right dither type overlay region (5 chars wide for "ORDER" or "BAYER")
+    localparam DITHER_CHARS = 5;
+    localparam [9:0] DITHER_X_START = SCREEN_WIDTH - (DITHER_CHARS * CHAR_WIDTH); // 640 - 40 = 600
+    logic in_dither_region;
+    logic [2:0] dither_pixel_col;
+    logic [2:0] dither_char_index; // 0..4
+    logic [7:0] dither_char;
+    logic [10:0] dither_font_addr;
+    logic        dither_text_on;
+    logic        in_dither_state;
+    
+    // Check if we're in DITHER state
+    assign in_dither_state = (safe_display_state == 5'd1); // DITHER state
+    
+    // Check dither region (same row as main text, overlaps gesture region when in DITHER state)
+    assign in_dither_region = in_dither_state && (draw_y >= TEXT_ROW_START) && (draw_y < TEXT_ROW_START + CHAR_HEIGHT) &&
+                              (draw_x >= DITHER_X_START) && (draw_x < DITHER_X_START + (DITHER_CHARS * CHAR_WIDTH));
+    assign dither_char_index = (draw_x - DITHER_X_START) / CHAR_WIDTH;
+    assign dither_pixel_col  = (draw_x - DITHER_X_START) % CHAR_WIDTH;
+    assign dither_char       = dither_word[dither_type][dither_char_index];
+    assign dither_font_addr  = {dither_char[6:0], pixel_row};
+    
+    // Bottom-right channel selector overlay region (4 chars wide for "RGB ", "_GB ", etc.)
+    localparam CHANNEL_CHARS = 4;
+    localparam [9:0] CHANNEL_X_START = SCREEN_WIDTH - (CHANNEL_CHARS * CHAR_WIDTH); // 640 - 32 = 608
+    logic in_channel_region;
+    logic [2:0] channel_pixel_col;
+    logic [1:0] channel_char_index; // 0..3
+    logic [7:0] channel_char;
+    logic [10:0] channel_font_addr;
+    logic        channel_text_on;
+    logic        in_channel_state;
+    
+    // Check if we're in CHANNEL_MODE state
+    assign in_channel_state = (safe_display_state == 5'd2); // CHANNEL_MODE state
+    
+    // Check channel region (same row as main text, overlaps gesture region when in CHANNEL_MODE state)
+    assign in_channel_region = in_channel_state && channel_mode_enable && (draw_y >= TEXT_ROW_START) && (draw_y < TEXT_ROW_START + CHAR_HEIGHT) &&
+                               (draw_x >= CHANNEL_X_START) && (draw_x < CHANNEL_X_START + (CHANNEL_CHARS * CHAR_WIDTH));
+    assign channel_char_index = (draw_x - CHANNEL_X_START) / CHAR_WIDTH;
+    assign channel_pixel_col = (draw_x - CHANNEL_X_START) % CHAR_WIDTH;
+    assign channel_char      = channel_word[channel_select][channel_char_index];
+    assign channel_font_addr = {channel_char[6:0], pixel_row};
 
     // Reuse same font ROM (shared) - sequential access ok for combinational read of one address per pixel
-    // We'll mux address: priority is scores > gesture > main text
+    // We'll mux address: priority is scores > dither > channel > gesture > main text
     // NOTE: Because font ROM is 1-port, pick address based on priority
     logic [10:0] final_font_addr;
     always_comb begin
         if (use_score_font) begin
             final_font_addr = score_font_addr_use;
+        end else if (in_dither_region) begin
+            final_font_addr = dither_font_addr;
+        end else if (in_channel_region) begin
+            final_font_addr = channel_font_addr;
         end else if ((gesture_code != 2'd0) && in_gesture_region) begin
             final_font_addr = gesture_font_addr;
         end else begin
@@ -203,12 +279,14 @@ module text_overlay (
     // font_data already driven via final_font_addr; derive per-region pixel bits
     assign text_pixel_on     = font_data[7 - pixel_col];
     assign gesture_text_on   = font_data[7 - gesture_pixel_col];
-    // (gesture_text_on computed above; no second font_addr assignment to avoid overriding gesture region)
+    assign dither_text_on     = font_data[7 - dither_pixel_col];
+    assign channel_text_on   = font_data[7 - channel_pixel_col];
+    // (gesture_text_on, dither_text_on, and channel_text_on computed above; no second font_addr assignment to avoid overriding regions)
     
     // Black background for all states except RAW (0) and GRAYSCALE (2)
     logic black_background;
     always_comb begin
-        black_background = (safe_display_state != 5'd0) && (safe_display_state != 5'd2);
+        black_background = (safe_display_state != 5'd0) && (safe_display_state != 5'd3);
     end
     
     // ------------------------------------------------------------
@@ -234,7 +312,7 @@ module text_overlay (
     logic score_a_pixel_on, score_b_pixel_on;
     logic in_pong_state;
     
-    assign in_pong_state = (safe_display_state == 5'd21);
+    assign in_pong_state = (safe_display_state == 5'd22);
     
     // Player A (left half) score region
     localparam [9:0] SCORE_CHAR_HALF_WIDTH = SCORE_CHAR_WIDTH >> 1;   // 64 pixels
@@ -339,27 +417,50 @@ module text_overlay (
 
             // Regular text overlay at bottom (only when not in PONG state)
             if (vde && in_text_row) begin
+                // Dither type indicator (bottom-right, when in DITHER state)
+                if (in_dither_region) begin
+                    if (dither_text_on && dither_char != 8'd32) begin
+                        pixel_red_out   = TEXT_RED;
+                        pixel_green_out = TEXT_GREEN;
+                        pixel_blue_out  = TEXT_BLUE;
+                    end else if (black_background) begin
+                        pixel_red_out   = 3'b000;
+                        pixel_green_out = 3'b000;
+                        pixel_blue_out  = 3'b000;
+                    end
+                end
+                // Channel selector indicator (bottom-right, when in CHANNEL_MODE state)
+                else if (in_channel_region) begin
+                    if (channel_text_on && channel_char != 8'd32) begin
+                        pixel_red_out   = TEXT_RED;
+                        pixel_green_out = TEXT_GREEN;
+                        pixel_blue_out  = TEXT_BLUE;
+                    end else if (black_background) begin
+                        pixel_red_out   = 3'b000;
+                        pixel_green_out = 3'b000;
+                        pixel_blue_out  = 3'b000;
+                    end
+                end
+                // Gesture indicator (bottom-right, when not in DITHER or CHANNEL_MODE state)
+                else if ((gesture_code != 2'd0) && in_gesture_region) begin
+                    if (gesture_text_on && gesture_char != 8'd32) begin
+                        pixel_red_out   = TEXT_RED;
+                        pixel_green_out = TEXT_GREEN;
+                        pixel_blue_out  = TEXT_BLUE;
+                    end else if (black_background) begin
+                        pixel_red_out   = 3'b000;
+                        pixel_green_out = 3'b000;
+                        pixel_blue_out  = 3'b000;
+                    end
+                end
                 // Main state text region (left)
-                if (in_text_region) begin
+                else if (in_text_region) begin
                     if (text_pixel_on && current_char != 8'd32) begin
                         pixel_red_out   = TEXT_RED;
                         pixel_green_out = TEXT_GREEN;
                         pixel_blue_out  = TEXT_BLUE;
                     end else if (black_background && current_char != 8'd32) begin
                         // Only draw black background for non-space characters
-                        pixel_red_out   = 3'b000;
-                        pixel_green_out = 3'b000;
-                        pixel_blue_out  = 3'b000;
-                    end
-                end
-                // Gesture word region (right): render whenever a gesture is active, independent of state overrides
-                if ((gesture_code != 2'd0) && in_gesture_region) begin
-                    if (gesture_text_on && gesture_char != 8'd32) begin
-                        pixel_red_out   = TEXT_RED;
-                        pixel_green_out = TEXT_GREEN;
-                        pixel_blue_out  = TEXT_BLUE;
-                    end else begin
-                        // Force black background box even for spaces for consistency
                         pixel_red_out   = 3'b000;
                         pixel_green_out = 3'b000;
                         pixel_blue_out  = 3'b000;

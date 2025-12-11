@@ -17,6 +17,44 @@
  *   - Control unit provides centralized state machine for demo modes
  *   - Motor controller enables object tracking with pan/tilt servos
  *   - Hex displays show potentiometer value and centroid X coordinate
+ *
+ * AI Usage:
+ *   - Generative AI was utilized in various ways througout the project:
+ *   - Almost ALL comments in the code were generated via AI Tab-Completion
+ *   - AI was utilized to generate character ROM data in text_overlay.sv
+ *   - AI was utilized to duplicate largely identical code segments in control_unit.sv
+ *   - AI was utilized to duplicate largely identical code segments in split_centroid_detector.sv
+ *   - AI was utilized to generate architecture.md file for project documentation 
+ *       -This required incremental prompts with each new file to save our architecutre docmentation for reference
+ *   - AI was utilized to catch port name typos in the various modules
+        -This was mostly done in the form of autocompletion override suggestions
+ *   - AI was utilized to tune better multiply/divide constants when we needed to multiply by floating point values
+ *   - AI was utilized across ALL modules in the form of tab-completion suggestions
+ *   - AI was utilized across ALL modules to assert stylistic differences between both partner's code
+ *   - AI was utilized to create many of the Description, Purpose, and Notes sections in each module
+ *   
+ * References:
+ * -Basic Camera Controlller inspired by Amsack's: https://github.com/amsacks/OV7670-camera
+ *  -The following files were closely modeled after Amsacks's work:
+ *      -cam_rom.sv
+ *      -cam_controller.sv
+ *      -cam_initializer.sv
+ *      -cam_interface.sv
+ *  -The followeing files were loosely modeled after Amsacks's work.architecture:
+ *      -buffer.sv
+ *      -sccb_master.sv (we used a different approach to generate the SCCB clock)
+ *  -The pot_controller.sv file was directly modeled after Ryan Liem's Project
+ *  -The following files were provided by the course throughtout the semester:
+ *      -sync.sv
+ *      -vga_controller.sv
+ *      -font_rom.sv
+ *      -hex_driver.sv
+ * -Additional processing pipeline was implemented by us, including:
+ *  -We used the following references in creating the following modules:
+ *      -skin_threshold.sv: https://medium.com/swlh/human-skin-color-classification-using-the-threshold-classifier-rgb-ycbcr-hsv-python-code-d34d51febdf8
+ *      -motor_driver.sv :https://www.handsontec.com/dataspecs/motor_fan/MG996R.pdf
+ 
+ *      -Urbana Board: https://www.realdigital.org/doc/496fed57c6b275735fe24c85de5718c2
  */
 
 module processor (
@@ -100,12 +138,16 @@ module processor (
     logic [3:0] skin_y_min;
     logic [3:0] skin_y_max;
     logic        color_threshold_enable;
-    logic [7:0]  color_select;
-    logic [3:0]  color_threshold_value;
+    logic [11:0] ref_color;
+    logic [5:0]  color_threshold_value;
     logic        gesture_enable;
+    logic        augment_enable;
     logic        split_centroid_enable;
+    logic        dither_enable;
     // (reference color/tolerance logic removed)
     logic [4:0] current_state_num;  // 5-bit to support states incl. GESTURE
+    // Transition trigger for ripple effect
+    logic        transition_trigger;
     
     // VGA signals
     logic [2:0] vga_red, vga_green, vga_blue;          // Final output to HDMI
@@ -276,6 +318,7 @@ module processor (
     //   btn[0] - Teach current gesture as WAVE
     // 
     // sw[2:0]  - Channel select (RGB) in CHANNEL_MODE state
+    // sw[11]   - Dither type: 0=ordered/simple, 1=Bayer (for DITHER state indicator)
     // sw[12]   - Learning mode toggle (changes button behavior)
     // sw[13]   - Compare mode (split screen: left=processed, right=raw)
     // sw[14]   - Bounding box overlay enable
@@ -312,13 +355,17 @@ module processor (
         .skin_y_min(skin_y_min),
         .skin_y_max(skin_y_max),
         .color_threshold_enable(color_threshold_enable),
-        .color_select(color_select),
+        .ref_color(ref_color),
         .color_threshold_value(color_threshold_value),
         .temporal_filter_enable(temporal_filter_enable),
         .gesture_enable(gesture_enable),
+        .augment_enable(augment_enable),
         .split_centroid_enable(split_centroid_enable),
+        .dither_enable(dither_enable),
         // (reference color/tolerance connections removed)
-        .current_state_num(current_state_num)
+        .current_state_num(current_state_num),
+        // Transition trigger
+        .transition_trigger(transition_trigger)
     );
 
     // ------------------------------------------------------------
@@ -418,7 +465,7 @@ module processor (
         .skin_y_min(skin_y_min),
         .skin_y_max(skin_y_max),
         .color_threshold_enable(color_threshold_enable && !force_grayscale),
-        .color_select(color_select),
+        .ref_color(ref_color),
         .color_threshold_value(color_threshold_value),
         .learning_mode(sw_sync[12]),        // sw[12]: Enable learning mode
         .learning_buttons(btn_sync),         // btn[2:0] for teaching gestures
@@ -485,7 +532,13 @@ module processor (
         // Otherwise: use normal processing pipeline
         .processing_enable((((grayscale_enable || threshold_enable || median_enable || convolution_enable || skin_threshold_enable || spatial_filter_enable || erosion_enable || dilation_enable || centroid_enable || blob_filter_enable || color_threshold_enable || temporal_filter_enable || split_centroid_enable) && !force_color) || force_grayscale)),
         // Temporal filter enable
-        .temporal_filter_enable(temporal_filter_enable),        
+        .temporal_filter_enable(temporal_filter_enable),
+        // Dither enable
+        .dither_enable(dither_enable),
+        // Dither type: sw[11] controls dithering method (0=simple, 1=Bayer)
+        .dither_type(sw_sync[11]),
+        // Force color override - disables dithering when active
+        .force_color(force_color),        
         // Original camera data (for color mode)
         .cam_pix_data(cam_pix_data),
         .cam_pix_addr(cam_pix_addr),
@@ -495,6 +548,9 @@ module processor (
         .cam_line_ready(cam_line_ready),
         // Compare mode: sw[13] toggles left processed/right raw split
         .compare_mode(sw_sync[13]),
+        
+        // Transition trigger for ripple effect (override toggles only)
+        .transition_trigger(transition_trigger),
         
         // VGA read interface
         .vga_pix_data(vga_pix_data),
@@ -548,7 +604,9 @@ module processor (
         .current_state(current_state_num), // Current state for text display
         // Gesture overlay enable comes from control unit's gesture state
         .gesture_enable(gesture_enable),   // Enable gesture text overlay
+        .augment_enable(augment_enable),   // Enable augment mode (square overlay)
         .split_centroid_enable(split_centroid_enable),
+        .dither_type(sw_sync[11]),        // Dither type: sw[11] controls dithering method (0=ordered, 1=Bayer)
         
         // VGA timing
         .draw_x(draw_x),
@@ -586,6 +644,9 @@ module processor (
         
         // Button inputs for pong
         .btn_sync(btn_sync),
+        
+        // Random number input for pong (from potentiometer noise)
+        .rng(pot_out[3:0]),
         
         // Input pixels from frame buffer
         .pixel_red_in(vga_red_raw),
