@@ -37,6 +37,9 @@ module buffer (
     // Processing control
     input  logic        processing_enable,
     input  logic        temporal_filter_enable,
+    input  logic        dither_enable,         // Enable dithered color compression
+    input  logic        dither_type,           // Dither type: 0=simple (x+y)%3, 1=Bayer matrix
+    input  logic        force_color,           // Force color override - disables dithering when active
     
     // Original camera data (for color mode)
     input  logic [11:0] cam_pix_data,
@@ -48,11 +51,74 @@ module buffer (
 
     // Compare mode: show processed on left half, raw(grayscale) on right half
     input  logic        compare_mode,
+    
+    // Transition trigger for ripple effect (override toggles only)
+    input  logic        transition_trigger,     // Pulse on override toggle (from clk_25m domain)
 
     // VGA output
     output logic [8:0]  vga_pix_data,
     output logic [1:0]  frame_chunk_counter
 );
+
+    // -----------------------------
+    // Ripple Transition Controller (in pclk domain)
+    // -----------------------------
+    // All transition logic handled here - control_unit only provides trigger pulse
+    logic transition_trigger_sync1, transition_trigger_sync2, transition_trigger_pclk;
+    logic transition_trigger_pulse;  // Edge detected trigger
+    
+    // Synchronize transition_trigger pulse from clk_25m to pclk domain
+    always_ff @(posedge pclk or negedge rst_n) begin
+        if (!rst_n) begin
+            transition_trigger_sync1 <= 1'b0;
+            transition_trigger_sync2 <= 1'b0;
+            transition_trigger_pclk <= 1'b0;
+        end else begin
+            transition_trigger_sync1 <= transition_trigger;
+            transition_trigger_sync2 <= transition_trigger_sync1;
+            transition_trigger_pclk <= transition_trigger_sync2;
+        end
+    end
+    
+    // Edge detect the synchronized trigger
+    logic transition_trigger_prev;
+    always_ff @(posedge pclk or negedge rst_n) begin
+        if (!rst_n) begin
+            transition_trigger_prev <= 1'b0;
+        end else begin
+            transition_trigger_prev <= transition_trigger_pclk;
+        end
+    end
+    assign transition_trigger_pulse = transition_trigger_pclk & ~transition_trigger_prev;
+    
+    // Ripple transition state machine (in pclk domain, uses camera frame timing)
+    localparam [9:0] RIPPLE_MAX_RADIUS = 10'd400;  // Maximum radius to cover 640x480 screen
+    localparam [9:0] RIPPLE_INCREMENT = 10'd50;    // Pixels to expand per frame (fast: ~8 frames to complete)
+    
+    logic transition_active_pclk;
+    logic [9:0] ripple_radius_pclk;
+    
+    always_ff @(posedge pclk or negedge rst_n) begin
+        if (!rst_n) begin
+            transition_active_pclk <= 1'b0;
+            ripple_radius_pclk <= 10'd0;
+        end else begin
+            if (transition_trigger_pulse) begin
+                // Start new transition on trigger pulse
+                transition_active_pclk <= 1'b1;
+                ripple_radius_pclk <= 10'd0;
+            end else if (transition_active_pclk && frame_start_pclk) begin
+                // Expand ripple on each camera frame start
+                if (ripple_radius_pclk < RIPPLE_MAX_RADIUS) begin
+                    ripple_radius_pclk <= ripple_radius_pclk + RIPPLE_INCREMENT;
+                end else begin
+                    // Transition complete
+                    transition_active_pclk <= 1'b0;
+                    ripple_radius_pclk <= 10'd0;
+                end
+            end
+        end
+    end
 
     // -----------------------------
     // Frame Counter (modulo 3) - tracks which 3-bit chunk is current frame
@@ -138,6 +204,19 @@ module buffer (
     logic [9:0] cam_x, proc_x;
     logic [2:0] cam_gray3;
     
+    // Dithering logic signals
+    logic [9:0] pix_x, pix_y;
+    logic [1:0] dither_pattern;
+    logic [1:0] dither_r, dither_g, dither_b;
+    logic [1:0] dither_r_simple, dither_g_simple, dither_b_simple;
+    logic [1:0] dither_r_bayer, dither_g_bayer, dither_b_bayer;
+    logic [1:0] bayer_x, bayer_y;
+    logic [3:0] bayer_index;
+    logic [3:0] bayer_value, bayer_g, bayer_b;
+    logic [4:0] r_with_dither, g_with_dither, b_with_dither;
+    logic [3:0] r_clamped, g_clamped, b_clamped;
+    logic [2:0] r_out, g_out, b_out;
+    
     // Pipelined read-modify-write for temporal filter
     always_ff @(posedge pclk or negedge rst_n) begin
         if (!rst_n) begin
@@ -203,12 +282,149 @@ module buffer (
             bram_write_enable = processed_valid;
         end else begin
             // Color modes: use original camera data
-            // Pack 12-bit RGB444 to 9-bit RGB333 (take top 3 bits of each channel)
-            cam_pix_data_9bit = {cam_pix_data[11:9], cam_pix_data[7:5], cam_pix_data[3:1]};
+            // Only apply dithering if enabled AND not forcing raw color (override)
+            if (dither_enable && !force_color) begin
+                // Dithered color compression: RGB444 -> RGB333 with rounding + dithering
+                // Extract pixel coordinates for dither pattern
+                pix_x = cam_pix_addr % 19'd640;
+                pix_y = cam_pix_addr / 19'd640;
+                
+                // Select dithering method based on dither_type
+                if (dither_type == 1'b0) begin
+                    // Simple position-based dither pattern: (x+y) % 3
+                    // Maps to: 0 -> -1, 1 -> 0, 2 -> +1
+                    dither_pattern = (pix_x + pix_y) % 3;
+                    
+                    // Convert pattern to dither value (-1, 0, +1)
+                    dither_r_simple = (dither_pattern == 2'd0) ? 2'b11 : (dither_pattern == 2'd2) ? 2'b01 : 2'b00;  // -1, 0, +1
+                    dither_g_simple = dither_r_simple;  // Apply same dither to all channels
+                    dither_b_simple = dither_r_simple;
+                    
+                    dither_r = dither_r_simple;
+                    dither_g = dither_g_simple;
+                    dither_b = dither_b_simple;
+                end else begin
+                    // Bayer matrix 4x4 ordered dithering
+                    // Bayer matrix: [0  8  2 10]
+                    //              [12 4 14  6]
+                    //              [3 11  1  9]
+                    //              [15 7 13  5]
+                    // Values 0-15, we'll use to create -1, 0, or +1 dither
+                    
+                    // Get position in 4x4 Bayer tile
+                    bayer_x = pix_x[1:0];
+                    bayer_y = pix_y[1:0];
+                    bayer_index = {bayer_y, bayer_x};  // 4-bit index (0-15)
+                    
+                    // 4x4 Bayer matrix lookup (values 0-15)
+                    case (bayer_index)
+                        4'd0:  bayer_value = 4'd0;
+                        4'd1:  bayer_value = 4'd8;
+                        4'd2:  bayer_value = 4'd2;
+                        4'd3:  bayer_value = 4'd10;
+                        4'd4:  bayer_value = 4'd12;
+                        4'd5:  bayer_value = 4'd4;
+                        4'd6:  bayer_value = 4'd14;
+                        4'd7:  bayer_value = 4'd6;
+                        4'd8:  bayer_value = 4'd3;
+                        4'd9:  bayer_value = 4'd11;
+                        4'd10: bayer_value = 4'd1;
+                        4'd11: bayer_value = 4'd9;
+                        4'd12: bayer_value = 4'd15;
+                        4'd13: bayer_value = 4'd7;
+                        4'd14: bayer_value = 4'd13;
+                        4'd15: bayer_value = 4'd5;
+                        default: bayer_value = 4'd0;
+                    endcase
+                    
+                    // Convert Bayer value (0-15) to dither (-1, 0, +1)
+                    // Thresholds: 0-4 = -1, 5-10 = 0, 11-15 = +1
+                    // This creates balanced dithering
+                    dither_r_bayer = (bayer_value < 5) ? 2'b11 : (bayer_value < 11) ? 2'b00 : 2'b01;  // -1, 0, +1
+                    // Offset Bayer for different channels to reduce correlation
+                    bayer_g = (bayer_value + 4'd5) % 16;   // Offset by 5
+                    bayer_b = (bayer_value + 4'd10) % 16;  // Offset by 10
+                    dither_g_bayer = (bayer_g < 5) ? 2'b11 : (bayer_g < 11) ? 2'b00 : 2'b01;
+                    dither_b_bayer = (bayer_b < 5) ? 2'b11 : (bayer_b < 11) ? 2'b00 : 2'b01;
+                    
+                    dither_r = dither_r_bayer;
+                    dither_g = dither_g_bayer;
+                    dither_b = dither_b_bayer;
+                end
+                
+                // Add dither to the 4-bit value (affects LSB), then take [3:1] like normal conversion
+                // This preserves bit mapping: same bit positions as raw, just with dither noise
+                // Normal conversion: takes [11:9], [7:5], [3:1] = drops LSB (bits 8, 4, 0)
+                // Dithered: add dither to full 4-bit value, clamp to prevent wrapping, then take [3:1]
+                
+                // Add dither to the full 4-bit value (sign-extend dither for addition)
+                r_with_dither = {1'b0, cam_pix_data[11:8]} + {{3{dither_r[1]}}, dither_r};
+                g_with_dither = {1'b0, cam_pix_data[7:4]} + {{3{dither_g[1]}}, dither_g};
+                b_with_dither = {1'b0, cam_pix_data[3:0]} + {{3{dither_b[1]}}, dither_b};
+                
+                // Clamp to valid 4-bit range (0-15) - prevent wrapping at boundaries
+                // Prevent underflow: if value is 0 and dither is -1, clamp to 0 (don't wrap to 15)
+                // Prevent overflow: if value is 15 and dither is +1, clamp to 15
+                // dither_r[1]==1 means -1 (2'b11), dither_r[1]==0 means 0 (2'b00) or +1 (2'b01)
+                r_clamped = ((cam_pix_data[11:8] == 4'd0) && (dither_r == 2'b11)) ? 4'd0 :  // Underflow protection
+                           ((cam_pix_data[11:8] == 4'd15) && (dither_r == 2'b01)) ? 4'd15 : // Overflow protection
+                           (r_with_dither > 5'd15) ? 4'd15 : r_with_dither[3:0];
+                g_clamped = ((cam_pix_data[7:4] == 4'd0) && (dither_g == 2'b11)) ? 4'd0 :
+                           ((cam_pix_data[7:4] == 4'd15) && (dither_g == 2'b01)) ? 4'd15 :
+                           (g_with_dither > 5'd15) ? 4'd15 : g_with_dither[3:0];
+                b_clamped = ((cam_pix_data[3:0] == 4'd0) && (dither_b == 2'b11)) ? 4'd0 :
+                           ((cam_pix_data[3:0] == 4'd15) && (dither_b == 2'b01)) ? 4'd15 :
+                           (b_with_dither > 5'd15) ? 4'd15 : b_with_dither[3:0];
+                
+                // Take [3:1] bits (same as normal conversion) - preserves bit mapping
+                r_out = r_clamped[3:1];
+                g_out = g_clamped[3:1];
+                b_out = b_clamped[3:1];
+                
+                cam_pix_data_9bit = {r_out, g_out, b_out};
+            end else begin
+                // Simple truncation: Pack 12-bit RGB444 to 9-bit RGB333 (take top 3 bits of each channel)
+                cam_pix_data_9bit = {cam_pix_data[11:9], cam_pix_data[7:5], cam_pix_data[3:1]};
+            end
             bram_write_addr = cam_pix_addr;
             bram_write_enable = cam_pix_write;
         end
     end
+
+    // -----------------------------
+    // Ripple Transition: Write Masking (Perfect Circle)
+    // -----------------------------
+    // Extract pixel coordinates from write address
+    logic [9:0] write_x, write_y;
+    logic [19:0] pixel_distance_squared;
+    logic [19:0] radius_squared;
+    logic write_inside_ripple;
+    
+    always_comb begin
+        // Extract coordinates from write address
+        write_x = bram_write_addr % 19'd640;
+        write_y = bram_write_addr / 19'd640;
+        
+        // Calculate distance squared from screen center (320, 240)
+        pixel_distance_squared = distance_squared(write_x, write_y, 10'd320, 10'd240);
+        
+        // Calculate radius squared for comparison
+        radius_squared = ripple_radius_pclk * ripple_radius_pclk;
+        
+        // Generate write mask: allow writes inside ripple radius (perfect circle)
+        if (transition_active_pclk) begin
+            // Only allow writes inside the expanding circle
+            // Compare squared distances to avoid sqrt
+            write_inside_ripple = (pixel_distance_squared < radius_squared);
+        end else begin
+            // No transition: allow all writes
+            write_inside_ripple = 1'b1;
+        end
+    end
+    
+    // Apply ripple mask to write enable
+    logic bram_write_enable_masked;
+    assign bram_write_enable_masked = bram_write_enable && write_inside_ripple;
 
     // -----------------------------
     // Helpers
@@ -221,6 +437,33 @@ module buffer (
     // Address mapping: addr = y*640 + x
     function automatic [18:0] xy_to_addr(input logic [9:0] x, input logic [9:0] y);
         xy_to_addr = ({9'b0, y} << 9) + ({9'b0, y} << 7) + x;
+    endfunction
+    
+    // -----------------------------
+    // Ripple Transition: Perfect Circle Distance Calculation
+    // -----------------------------
+    // Perfect Euclidean distance: sqrt(dx² + dy²)
+    // For comparison, we use distance squared to avoid sqrt
+    // Center: (320, 240) - screen center
+    function automatic [19:0] distance_squared(
+        input logic [9:0] x,
+        input logic [9:0] y,
+        input logic [9:0] center_x,
+        input logic [9:0] center_y
+    );
+        logic [9:0] dx, dy;
+        logic [19:0] dx_squared, dy_squared;
+        
+        // Calculate absolute differences from center
+        dx = (x >= center_x) ? (x - center_x) : (center_x - x);
+        dy = (y >= center_y) ? (y - center_y) : (center_y - y);
+        
+        // Calculate squares (10-bit input → 20-bit output max: 640² = 409600)
+        dx_squared = dx * dx;
+        dy_squared = dy * dy;
+        
+        // Return distance squared
+        distance_squared = dx_squared + dy_squared;
     endfunction
 
     // -----------------------------
@@ -308,7 +551,7 @@ module buffer (
         .dina  (cam_pix_data_9bit),
         .douta (bram_dout_a),  // Read existing data for read-modify-write
         .ena   (1'b1),
-        .wea   (bram_write_enable && (bram_read_stage || !temporal_filter_enable || !processing_enable)),
+        .wea   (bram_write_enable_masked && (bram_read_stage || !temporal_filter_enable || !processing_enable)),
 
         // Port B (read for VGA, 1-cycle latency): use registered address
         .addrb (prefetch_addr_q),
@@ -346,3 +589,4 @@ module buffer (
     assign vga_pix_data = (left_edge_clamp || border_clamp) ? 9'd0 : (vde ? bram_dout_q : 9'd0);
 
 endmodule
+
